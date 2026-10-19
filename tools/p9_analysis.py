@@ -26,6 +26,8 @@ from hashirihyo_dict import CATEGORIES, classify  # noqa: E402
 TRAIN = ("2022-01-01", "2024-12-31")
 DEV = ("2025-01-01", "2025-12-31")
 TEST = ("2026-01-01", "2026-08-31")
+HF = None  # (race_id, 車番) -> 並び・市場（tools/hist_features.py の出力）。--hist-features で読み込む
+USE_LINES = USE_MARKET = False
 STYLE = False  # 脚質（逃・両・追）を基準に入れるか。--style で有効（結果を見た後に加えた比較。最終テストでのみ判定）
 
 
@@ -72,6 +74,18 @@ def build(races, final: bool):
                 continue
             if d1 >= TEST[0] and not final:
                 continue
+            extra = {}
+            if USE_LINES or USE_MARKET:
+                h = HF.get((rid1, r1["car_no"]))
+                if h is None or (USE_LINES and not h["line_pos"]) or (USE_MARKET and not h["mkt_top3"]):
+                    continue  # 並び・市場がないレースは、どのモデルの比較からも外す（同じ標本で比べるため）
+                if USE_LINES:
+                    extra.update({"lpos_" + h["line_pos"]: 1.0, "lsize_" + str(min(int(h["line_size"]), 4)): 1.0,
+                                  "nlines_" + str(min(int(h["n_lines"]), 5)): 1.0, "seri": float(h["seri"] or 0)})
+                if USE_MARKET:
+                    for k in ("mkt_top3", "mkt_win"):
+                        q = min(max(float(h[k]), 1e-4), 1 - 1e-4)
+                        extra["logit_" + k] = math.log(q / (1 - q))
             arr = field[rid1]
             s = arr[i1]
             if np.isnan(s) or np.all(np.isnan(arr)):
@@ -89,6 +103,7 @@ def build(races, final: bool):
                     "log_gap": math.log1p(gap), "same_meet": float(gap <= 1 and r0["venue_code"] == r1["venue_code"]),
                     "prev_" + (rk0 if rk0.isdigit() else "x"): 1.0, "last3_mean": float(np.mean(last3)) / 9,
                     **({"style_" + (r1["running_style"] or "na"): 1.0} if STYLE else {}),
+                    **extra,
                 },
             })
     return rows
@@ -128,9 +143,17 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--final", action="store_true")
     ap.add_argument("--style", action="store_true")
+    ap.add_argument("--hist-features", help="tools/hist_features.py の出力（並び・市場）")
+    ap.add_argument("--lines", action="store_true", help="基準に並び（ライン内の位置・車数・ライン数・競り）を加える")
+    ap.add_argument("--market", action="store_true", help="基準に市場の評価（確定オッズの3着以内・1着の確率）を加える（B1）")
     a = ap.parse_args(argv)
-    global STYLE
-    STYLE = a.style
+    global STYLE, HF, USE_LINES, USE_MARKET
+    STYLE, USE_LINES, USE_MARKET = a.style, a.lines, a.market
+    if a.lines or a.market:
+        HF = {}
+        with gzip.open(a.hist_features, "rt", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                HF[(r["race_id"], r["car"])] = r
     rows = build(load(a.runners), a.final)
     tr = [r for r in rows if TRAIN[0] <= r["date"] <= TRAIN[1]]
     ev_range = TEST if a.final else DEV
