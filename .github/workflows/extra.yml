@@ -1,0 +1,103 @@
+name: extra
+
+# Kドリームス・オッズパークのページ（走り評・記者評価・選手コメント・レース後談話）の収集。
+# 月ごと（stride で連鎖、2022-01 まで）と、毎朝の前日分（schedule）の2通り。
+on:
+  schedule:
+    - cron: "17 21 * * *"   # 毎日 06:17 JST に前日分
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "収集する月（YYYY-MM）。空なら前日1日分"
+        required: false
+        default: ""
+      stride:
+        description: "連鎖の間隔（か月）。0 なら連鎖しない"
+        required: false
+        default: "0"
+      attempt:
+        description: "同じ月の再開回数（自動で増える）"
+        required: false
+        default: "1"
+
+concurrency:
+  group: extra-${{ github.event.inputs.month || 'daily' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  TZ: Asia/Tokyo
+  DATA_REPO: ${{ github.repository_owner }}/mykeirin2
+  TAG: extra
+  FIRST_MONTH: "2022-01"
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+      MONTH: ${{ github.event.inputs.month }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Decide target
+        id: t
+        run: |
+          if [ -n "$MONTH" ]; then
+            echo "args=--month $MONTH" >> "$GITHUB_OUTPUT"; echo "ym=$(echo $MONTH | tr -d '-')" >> "$GITHUB_OUTPUT"
+          else
+            D=$(date -d 'yesterday' +%F); echo "args=--date $D" >> "$GITHUB_OUTPUT"; echo "ym=$(date -d 'yesterday' +%Y%m)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download existing file (resume)
+        run: |
+          mkdir -p extra
+          gh release download "$TAG" --repo "$DATA_REPO" -p "extra_${{ steps.t.outputs.ym }}.jsonl.gz" -D extra --clobber 2>/dev/null || echo "no existing file"
+
+      - name: Collect
+        run: python logger/collect_extra.py ${{ steps.t.outputs.args }} --out-dir extra --max-minutes 320 --status-file status.json
+
+      - name: Upload
+        if: always()
+        run: |
+          gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "extra" --notes "Kドリームス・オッズパークの走り評・記者評価・選手コメント・レース後談話（月ごとのファイル）"
+          for F in extra/extra_*.jsonl.gz; do
+            [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
+          done
+
+      - name: Chain next run
+        if: success() && github.event.inputs.month != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STRIDE: ${{ github.event.inputs.stride }}
+          ATTEMPT: ${{ github.event.inputs.attempt }}
+        run: |
+          STATE=$(python -c "import json;print(json.load(open('status.json'))['state'])" 2>/dev/null || echo unknown)
+          echo "state=$STATE month=$MONTH stride=$STRIDE attempt=$ATTEMPT"
+          if [ "$STATE" = "time_limit" ]; then
+            if [ "$ATTEMPT" -lt 4 ]; then
+              gh api -X POST "repos/${{ github.repository }}/actions/workflows/extra.yml/dispatches" \
+                -f ref=main -f "inputs[month]=$MONTH" -f "inputs[stride]=$STRIDE" -f "inputs[attempt]=$((ATTEMPT+1))"
+            else
+              echo "attempt limit reached; stop"
+            fi
+          elif [ "$STATE" = "finished" ] && [ "$STRIDE" -gt 0 ]; then
+            NEXT=$(python -c "y,m=map(int,'$MONTH'.split('-'));t=y*12+m-1-$STRIDE;print(f'{t//12:04d}-{t%12+1:02d}')")
+            if [[ "$NEXT" < "$FIRST_MONTH" ]]; then
+              echo "reached $FIRST_MONTH; chain ends"
+            else
+              gh api -X POST "repos/${{ github.repository }}/actions/workflows/extra.yml/dispatches" \
+                -f ref=main -f "inputs[month]=$NEXT" -f "inputs[stride]=$STRIDE" -f "inputs[attempt]=1"
+            fi
+          fi
