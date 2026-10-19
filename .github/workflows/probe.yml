@@ -1,0 +1,26 @@
+name: probe
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "name=url をスペース区切りで"
+        required: true
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+      DATA_REPO: ${{ github.repository_owner }}/mykeirin2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python tools/probe.py ${{ github.event.inputs.targets }}
+      - name: Upload
+        run: |
+          gh release view probe --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create probe --repo "$DATA_REPO" --title probe --notes "ページ構造の確認用"
+          tar czf probe.tgz probe && gh release upload probe probe.tgz --repo "$DATA_REPO" --clobber
