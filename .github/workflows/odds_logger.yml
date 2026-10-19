@@ -2,8 +2,8 @@ name: odds-logger
 
 on:
   schedule:
-    # UTC 22:00-15:59 = JST 07:00-00:59 の10分おき
-    - cron: "*/10 22-23,0-15 * * *"
+    # UTC 22:00-15:59 = JST 07:00-00:59 の10分おき（混雑する毎時0分を避けて3分始まり）
+    - cron: "3-59/10 22-23,0-15 * * *"
   workflow_dispatch:
     inputs:
       window_min:
