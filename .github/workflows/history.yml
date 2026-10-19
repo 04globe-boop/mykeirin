@@ -1,0 +1,53 @@
+name: history
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "収集する月（YYYY-MM）"
+        required: true
+
+concurrency:
+  group: history-${{ github.event.inputs.month }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Tokyo
+  DATA_REPO: ${{ github.repository_owner }}/mykeirin2
+  TAG: hist
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Download existing file (resume)
+        run: |
+          mkdir -p hist
+          M=$(echo "${{ github.event.inputs.month }}" | tr -d '-')
+          gh release download "$TAG" --repo "$DATA_REPO" -p "hist_${M}.jsonl.gz" -D hist --clobber 2>/dev/null || echo "no existing file"
+
+      - name: Collect
+        run: python logger/collect_history.py --month "${{ github.event.inputs.month }}" --out-dir hist --max-minutes 320
+
+      - name: Upload
+        if: always()
+        run: |
+          gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "history" --notes "過去レースの確定オッズ・並び予想・出走表（月ごとのファイル）"
+          for F in hist/hist_*.jsonl.gz; do
+            [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
+          done
