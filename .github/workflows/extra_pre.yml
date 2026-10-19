@@ -1,0 +1,46 @@
+name: extra-pre
+
+# レース前の時点の、Kドリームス・オッズパークの選手コメント・記者評価を残す（後から書き換えられていないかの確認と、当日の予想用）。
+# 締切前オッズの記録（odds-logger）とは別の仕組みにして、時刻の精度に影響しないようにしている。
+on:
+  schedule:
+    - cron: "11,41 22-23,0-14 * * *"   # 07:11〜23:41 JST の30分ごと
+  workflow_dispatch:
+
+concurrency:
+  group: extra-pre
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Tokyo
+  DATA_REPO: ${{ github.repository_owner }}/mykeirin2
+  TAG: extra-pre
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Download today's file
+        run: |
+          mkdir -p pre
+          gh release download "$TAG" --repo "$DATA_REPO" -p "extra_pre_$(date +%Y%m%d).jsonl.gz" -D pre --clobber 2>/dev/null || echo "no existing file"
+      - name: Collect
+        run: python logger/collect_extra.py --pre --lead-min 10 --window-min 100 --out-dir pre --max-minutes 20
+      - name: Upload
+        if: always()
+        run: |
+          gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "extra-pre" --notes "レース前の時点の選手コメント・記者評価（日ごとのファイル）"
+          for F in pre/extra_pre_*.jsonl.gz; do
+            [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
+          done

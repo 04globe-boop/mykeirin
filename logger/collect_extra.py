@@ -91,8 +91,8 @@ def done_keys(path: str) -> set:
                 r = json.loads(line)
             except ValueError:
                 continue
-            if r.get("type") in ("k", "op"):
-                keys.add((r["type"], r["race_id"]))
+            if r.get("type") in ("k", "op", "k_pre", "op_pre"):
+                keys.add((r["type"].replace("_pre", ""), r["race_id"]))
     return keys
 
 
@@ -101,13 +101,20 @@ def main(argv=None) -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--month", help="YYYY-MM（その月の昨日までを収集）")
     g.add_argument("--date", help="YYYY-MM-DD（1日分）")
+    g.add_argument("--pre", action="store_true",
+                   help="締切前の取得：今日のレースのうち、締切が --lead-min〜--window-min 分後のものを取る（レース前の時点の記録）")
+    ap.add_argument("--lead-min", type=float, default=10)
+    ap.add_argument("--window-min", type=float, default=100)
     ap.add_argument("--out-dir", default="extra")
     ap.add_argument("--max-minutes", type=float, default=320)
     ap.add_argument("--interval", type=float, default=1.0, help="同じサイトへのリクエスト間隔（秒）")
     ap.add_argument("--status-file")
     a = ap.parse_args(argv)
 
-    if a.month:
+    now0 = datetime.now(JST)
+    if a.pre:
+        days = [now0.date()]
+    elif a.month:
         y, m = (int(x) for x in a.month.split("-"))
         days, d = [], date(y, m, 1)
         while d.month == m:
@@ -117,7 +124,7 @@ def main(argv=None) -> int:
         days = [date.fromisoformat(a.date)]
     ym = days[0].strftime("%Y%m")
     os.makedirs(a.out_dir, exist_ok=True)
-    path = os.path.join(a.out_dir, f"extra_{ym}.jsonl.gz")
+    path = os.path.join(a.out_dir, f"extra_pre_{days[0].strftime('%Y%m%d')}.jsonl.gz" if a.pre else f"extra_{ym}.jsonl.gz")
     have = done_keys(path)
     nk = NetkeirinClient(min_interval=0.8)
     fetchers = {"k": Fetcher(a.interval), "op": Fetcher(a.interval)}  # サイトごとに別々に取得（2つを同時に進める）
@@ -136,7 +143,7 @@ def main(argv=None) -> int:
                 json.dump({"state": state, **kw}, f, ensure_ascii=False)
 
     for d in days:
-        if d >= today:
+        if d >= today and not a.pre:
             break
         ds = d.strftime("%Y%m%d")
         try:
@@ -149,6 +156,15 @@ def main(argv=None) -> int:
             rid = race.get("race_id")
             if not rid:
                 continue
+            if a.pre:
+                try:
+                    hh, mm = (int(x) for x in str(race.get("close") or "").split(":"))
+                except ValueError:
+                    continue
+                close = datetime.combine(d, datetime.min.time(), tzinfo=JST) + timedelta(hours=hh, minutes=mm)
+                lead = (close - datetime.now(JST)).total_seconds() / 60
+                if not (a.lead_min <= lead <= a.window_min):
+                    continue
             if (time.monotonic() - t0) / 60 > a.max_minutes:
                 status("time_limit", new=n_new, errors=n_err, at=ds)
                 print(json.dumps({"stopped": "time limit", "new": n_new, "errors": n_err, "at": ds}))
@@ -175,12 +191,13 @@ def main(argv=None) -> int:
                     write({"type": "error", "what": kind, "race_id": rid, "url": url, "error": "parse: " + str(e)[:200]})
                     n_err += 1
                     continue
-                write({"type": kind, "race_id": rid, "url": url, "fetched_at": now, "data": data})
+                write({"type": kind + ("_pre" if a.pre else ""), "race_id": rid, "url": url, "fetched_at": now,
+                       **({"close": race.get("close")} if a.pre else {}), "data": data})
                 have.add((kind, rid))
                 n_new += 1
         print(f"{ds}: races={len(races)} total_new={n_new} errors={n_err}", flush=True)
     status("finished", new=n_new, errors=n_err)
-    print(json.dumps({"finished": a.month or a.date, "new": n_new, "errors": n_err}))
+    print(json.dumps({"finished": a.month or a.date or "pre", "new": n_new, "errors": n_err}))
     return 0
 
 
