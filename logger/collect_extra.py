@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -119,7 +120,8 @@ def main(argv=None) -> int:
     path = os.path.join(a.out_dir, f"extra_{ym}.jsonl.gz")
     have = done_keys(path)
     nk = NetkeirinClient(min_interval=0.8)
-    fx = Fetcher(a.interval)
+    fetchers = {"k": Fetcher(a.interval), "op": Fetcher(a.interval)}  # サイトごとに別々に取得（2つを同時に進める）
+    pool = ThreadPoolExecutor(max_workers=2)
     t0 = time.monotonic()
     today = datetime.now(JST).date()
     n_new = n_err = 0
@@ -147,19 +149,21 @@ def main(argv=None) -> int:
             rid = race.get("race_id")
             if not rid:
                 continue
-            for kind, url, parser in (("k", kdreams_url(race), parse_kdreams), ("op", oddspark_url(race), parse_oddspark)):
-                if (kind, rid) in have:
-                    continue
-                if (time.monotonic() - t0) / 60 > a.max_minutes:
-                    status("time_limit", new=n_new, errors=n_err, at=ds)
-                    print(json.dumps({"stopped": "time limit", "new": n_new, "errors": n_err, "at": ds}))
-                    return 0
+            if (time.monotonic() - t0) / 60 > a.max_minutes:
+                status("time_limit", new=n_new, errors=n_err, at=ds)
+                print(json.dumps({"stopped": "time limit", "new": n_new, "errors": n_err, "at": ds}))
+                return 0
+            todo = [(kind, url, parser) for kind, url, parser in
+                    (("k", kdreams_url(race), parse_kdreams), ("op", oddspark_url(race), parse_oddspark))
+                    if (kind, rid) not in have]
+            futs = {kind: pool.submit(fetchers[kind].get, url) for kind, url, _ in todo if url}
+            for kind, url, parser in todo:
                 now = datetime.now(JST).isoformat(timespec="seconds")
                 if url is None:
                     write({"type": "error", "what": kind, "race_id": rid, "error": "no url (venue or kaisai info missing)"})
                     n_err += 1
                     continue
-                code, body = fx.get(url)
+                code, body = futs[kind].result()
                 if code != 200:
                     write({"type": "error", "what": kind, "race_id": rid, "url": url, "status": code,
                            "error": body if isinstance(body, str) else None, "fetched_at": now})
