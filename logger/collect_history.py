@@ -59,7 +59,13 @@ def main(argv=None) -> int:
     ap.add_argument("--out-dir", default="hist")
     ap.add_argument("--max-minutes", type=float, default=330, help="この時間を超えたら区切りよく止める")
     ap.add_argument("--interval", type=float, default=0.8, help="リクエスト間隔（秒）")
+    ap.add_argument("--status-file", help="終了状態（finished / time_limit）と件数を書き出すファイル（連鎖起動の判定用）")
     a = ap.parse_args(argv)
+
+    def status(state, **kw):
+        if a.status_file:
+            with open(a.status_file, "w", encoding="utf-8") as f:
+                json.dump({"state": state, **kw}, f, ensure_ascii=False)
 
     os.makedirs(a.out_dir, exist_ok=True)
     path = os.path.join(a.out_dir, f"hist_{a.month.replace('-', '')}.jsonl.gz")
@@ -92,6 +98,7 @@ def main(argv=None) -> int:
                 continue
             if (time.monotonic() - t0) / 60 > a.max_minutes:
                 print(json.dumps({"stopped": "time limit", "new": n_new, "errors": n_err, "at": ds}, ensure_ascii=False))
+                status("time_limit", new=n_new, errors=n_err, at=ds)
                 return 0
             rec = {"type": "race", "race_id": rid, "kaisai_date": ds,
                    "fetched_at": datetime.now(JST).isoformat(timespec="seconds")}
@@ -111,6 +118,7 @@ def main(argv=None) -> int:
             n_err += 0 if ok else 1
         print(f"{ds}: races={len(races)} total_new={n_new} errors={n_err}", flush=True)
     print(json.dumps({"finished": a.month, "new": n_new, "errors": n_err}, ensure_ascii=False))
+    status("finished", new=n_new, errors=n_err)
     return 0
 
 

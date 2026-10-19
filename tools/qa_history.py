@@ -72,24 +72,40 @@ def main(argv=None):
         if not od.get("official_dt"):
             c["no_official_dt"] += 1
             examples.setdefault("no_official_dt", rid)
+        # 欠車：2車単で、その車番が絡む目のオッズがすべて0
+        cars = {x[0][:2] for x in od.get("list_6") or []} | {x[0][2:4] for x in od.get("list_6") or []}
+        scratched = {car for car in cars
+                     if all(float(x[1] or 0) == 0 for x in od.get("list_6") or [] if car in (x[0][:2], x[0][2:4]))}
+        if scratched:
+            c["races_with_scratch"] += 1
+        c["trifecta_capped_9999"] += sum(1 for x in od.get("list_9") or [] if float(x[1] or 0) >= 9999.9)
+        c["trifecta_combos"] += len(od.get("list_9") or [])
         for k, fn in EXPECTED.items():
             lst = od.get(k) or []
             if n and len(lst) != fn(n):
                 c[f"count_mismatch_{NAMES[k]}"] += 1
                 examples.setdefault(f"count_mismatch_{NAMES[k]}", f"{rid} n={n} got={len(lst)} exp={fn(n)}")
+            if k == "list_7":
+                continue  # ワイドは1レースで3組が的中するので、1/Σ(1/オッズ) は払戻率にならない
             pr = payout_rate(lst)
             if pr is not None and not (0.70 <= pr <= 0.78):
                 rate_out[NAMES[k]] += 1
-                examples.setdefault(f"rate_{NAMES[k]}", f"{rid} {pr:.3f}")
+                examples.setdefault(f"rate_{NAMES[k]}", f"{rid} n={n} {pr:.3f}")
         ent = r.get("entries") or []
         if n and isinstance(ent, list) and len(ent) != n:
             c["entries_count_mismatch"] += 1
             examples.setdefault("entries_count_mismatch", f"{rid} n={n} entries={len(ent)}")
         lp = r.get("lines_parsed") or []
         flat = [x for line in lp for x in line]
+        # 欠車の選手は、並び予想に残っている場合（欠車の発表前に作られた予想）と、消えている場合がある。
+        # 欠車を除いた並びが、走る選手全員をちょうど1回ずつ含むかを見る
+        n_run = n - len(scratched)
+        if any(f"{int(x):02d}" in scratched for x in flat if str(x).isdigit()):
+            c["lines_include_scratched"] += 1
+        flat = [x for x in flat if not (str(x).isdigit() and f"{int(x):02d}" in scratched)]
         if not lp:
             c["lines_missing"] += 1
-        elif n and (len(flat) != n or len(set(flat)) != n):
+        elif n and (len(flat) != n_run or len(set(flat)) != n_run):
             c["lines_incomplete"] += 1
             examples.setdefault("lines_incomplete", f"{rid} n={n} lines={lp}")
     report = {"counts": dict(c), "payout_rate_out_of_range": dict(rate_out), "examples": examples,

@@ -1,11 +1,22 @@
 name: history
 
+# 過去レースの一括収集（月ごと）。
+# stride を 1 以上にすると、月が終わったら stride か月前の月を自動で起動する（2022-01 まで）。
+# 時間切れで止まったときは、同じ月を起動し直して続きから再開する（attempt が 4 を超えたら止める）。
 on:
   workflow_dispatch:
     inputs:
       month:
         description: "収集する月（YYYY-MM）"
         required: true
+      stride:
+        description: "連鎖の間隔（か月）。0 なら連鎖しない"
+        required: false
+        default: "0"
+      attempt:
+        description: "同じ月の再開回数（自動で増える）"
+        required: false
+        default: "1"
 
 concurrency:
   group: history-${{ github.event.inputs.month }}
@@ -13,11 +24,13 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 env:
   TZ: Asia/Tokyo
   DATA_REPO: ${{ github.repository_owner }}/mykeirin2
   TAG: hist
+  FIRST_MONTH: "2022-01"
 
 jobs:
   collect:
@@ -42,7 +55,7 @@ jobs:
           gh release download "$TAG" --repo "$DATA_REPO" -p "hist_${M}.jsonl.gz" -D hist --clobber 2>/dev/null || echo "no existing file"
 
       - name: Collect
-        run: python logger/collect_history.py --month "${{ github.event.inputs.month }}" --out-dir hist --max-minutes 320
+        run: python logger/collect_history.py --month "${{ github.event.inputs.month }}" --out-dir hist --max-minutes 320 --status-file status.json
 
       - name: Upload
         if: always()
@@ -51,3 +64,30 @@ jobs:
           for F in hist/hist_*.jsonl.gz; do
             [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
           done
+
+      - name: Chain next run
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MONTH: ${{ github.event.inputs.month }}
+          STRIDE: ${{ github.event.inputs.stride }}
+          ATTEMPT: ${{ github.event.inputs.attempt }}
+        run: |
+          STATE=$(python -c "import json;print(json.load(open('status.json'))['state'])" 2>/dev/null || echo unknown)
+          echo "state=$STATE month=$MONTH stride=$STRIDE attempt=$ATTEMPT"
+          if [ "$STATE" = "time_limit" ]; then
+            if [ "$ATTEMPT" -lt 4 ]; then
+              gh api -X POST "repos/${{ github.repository }}/actions/workflows/history.yml/dispatches" \
+                -f ref=main -f "inputs[month]=$MONTH" -f "inputs[stride]=$STRIDE" -f "inputs[attempt]=$((ATTEMPT+1))"
+            else
+              echo "attempt limit reached; stop"
+            fi
+          elif [ "$STATE" = "finished" ] && [ "$STRIDE" -gt 0 ]; then
+            NEXT=$(python -c "y,m=map(int,'$MONTH'.split('-'));t=y*12+m-1-$STRIDE;print(f'{t//12:04d}-{t%12+1:02d}')")
+            if [[ "$NEXT" < "$FIRST_MONTH" ]]; then
+              echo "reached $FIRST_MONTH; chain ends"
+            else
+              gh api -X POST "repos/${{ github.repository }}/actions/workflows/history.yml/dispatches" \
+                -f ref=main -f "inputs[month]=$NEXT" -f "inputs[stride]=$STRIDE" -f "inputs[attempt]=1"
+            fi
+          fi
