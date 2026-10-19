@@ -46,8 +46,8 @@ def done_races(path: str) -> tuple[set, set]:
                 r = json.loads(line)
             except ValueError:
                 continue  # 途中で切れた行は無視
-            if r.get("type") == "race":
-                races.add(r["race_id"])
+            if r.get("type") == "race" and not r.get("errors"):
+                races.add(r["race_id"])  # 取得に失敗した部分があるレースは、次の実行で取り直す
             elif r.get("type") == "racelist":
                 days.add(r["kaisai_date"])
     return races, days
@@ -113,7 +113,8 @@ def main(argv=None) -> int:
             if isinstance(rec.get("lines"), dict):
                 rec["lines_parsed"] = parse_lines(rec["lines"])
             write(rec)
-            have.add(rid)
+            if ok:
+                have.add(rid)
             n_new += 1
             n_err += 0 if ok else 1
         print(f"{ds}: races={len(races)} total_new={n_new} errors={n_err}", flush=True)
