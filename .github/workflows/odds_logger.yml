@@ -48,8 +48,26 @@ jobs:
             gh release download "$TAG" --repo "$DATA_REPO" -p "odds_${D}.jsonl.gz" -D data --clobber 2>/dev/null || echo "no existing file for $D"
           done
 
+      - name: Prepare frozen research inference
+        id: research
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: python logger/research_assets.py prepare --repo "$DATA_REPO"
+
       - name: Run logger
-        run: python logger/run_logger.py --out-dir data --window-min "${{ github.event.inputs.window_min || '12' }}"
+        env:
+          RESEARCH_READY: ${{ steps.research.outcome }}
+        run: |
+          ARGS=()
+          if [ "$RESEARCH_READY" = "success" ]; then ARGS+=(--research-bundle research-runtime/bundle); fi
+          python logger/run_logger.py --out-dir data --window-min "${{ github.event.inputs.window_min || '12' }}" "${ARGS[@]}"
+
+      - name: Upload prospective research records
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: python logger/research_assets.py upload --repo "$DATA_REPO"
 
       - name: Upload to data repo
         if: always()

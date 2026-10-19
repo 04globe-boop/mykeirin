@@ -30,13 +30,13 @@ from netkeirin import NetkeirinClient, parse_lines  # noqa: E402
 JST = ZoneInfo("Asia/Tokyo")
 PRE_OFFSETS = [-60, -30, -20, -15, -10, -7, -5, -3, -2, -1]  # 締切からの分
 POST_OFFSETS = [8, 15, 30]  # 確定値（official_dt あり）が取れた時点で以降は取らない
-CARD_OFFSETS = {-60, -5}  # 並び予想・出走表も取る時点
+CARD_OFFSETS = {-60, -7, -5}  # -7 also supplies an actually captured card before the T-5 forecast
 RACELIST_REFRESH_SEC = 300
 POST_DEADLINE_MIN = 180  # 締切後この分数までは確定オッズを取りに行く
 MISS_RECORD_WINDOW_MIN = 30  # これより古い予定時刻の取り逃しはファイルに書かない（初回起動時のノイズ防止）
 RACELIST_FIELDS = ("race_id", "jyo_cd", "jyo", "race_name", "jyoken", "kaisai_date", "kaisai_date_1st", "nichiji",
                    "tosu", "kyori", "start", "close", "race_status", "sale_status", "tenko", "update_datetime")
-RACELIST_HASH_FIELDS = ("race_id", "start", "close", "tosu", "race_status")
+RACELIST_HASH_FIELDS = RACELIST_FIELDS
 
 
 def tolerance_min(offset: int) -> float:
@@ -128,13 +128,14 @@ def iso(dt: datetime) -> str:
 
 
 class Logger:
-    def __init__(self, client, out_dir: str, window_min: float, clock=None, sleeper=None, log=print):
+    def __init__(self, client, out_dir: str, window_min: float, clock=None, sleeper=None, log=print,forecaster=None):
         self.client = client
         self.out_dir = out_dir
         self.window = timedelta(minutes=window_min)
         self.clock = clock or (lambda: datetime.now(JST))
         self.sleep = sleeper or time.sleep
         self.log = log
+        self.forecaster=forecaster
         self.races: dict[str, Race] = {}
         self.last_refresh: datetime | None = None
         self.counts = {"odds": 0, "lines": 0, "entries": 0, "miss": 0, "error": 0}
@@ -156,7 +157,8 @@ class Logger:
             key = [[r.get(k) for k in RACELIST_HASH_FIELDS] for r in compact]
             h = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()[:16]
             if self.state.racelist_hash.get(d) != h:
-                append(self.out_dir, d, {"type": "racelist", "kaisai_date": d, "fetched_at": iso(now), "hash": h, "data": compact})
+                append(self.out_dir, d, {"type": "racelist", "kaisai_date": d,
+                       "fetched_at": self.clock().astimezone(JST).isoformat(timespec="microseconds"), "hash": h, "data": compact})
                 self.state.racelist_hash[d] = h
             for r in to_races(raw):
                 self.races[r.race_id] = r
@@ -197,7 +199,8 @@ class Logger:
         try:
             od = self.client.odds(r.race_id)
             got = self.clock()
-            append(self.out_dir, r.kaisai_date, {"type": "odds", **base, "fetched_at": iso(got), "data": od})
+            append(self.out_dir, r.kaisai_date, {"type": "odds", **base,
+                   "fetched_at": got.astimezone(JST).isoformat(timespec="microseconds"), "data": od})
             self.counts["odds"] += 1
             if off > 0 and isinstance(od, dict) and od.get("official_dt"):
                 self.state.finals.add(r.race_id)
@@ -212,7 +215,7 @@ class Logger:
                     continue
                 try:
                     data = fn(r.race_id)
-                    rec = {"type": typ, **base, "fetched_at": iso(self.clock()), "data": data}
+                    rec = {"type": typ, **base, "fetched_at": self.clock().astimezone(JST).isoformat(timespec="microseconds"), "data": data}
                     if typ == "lines":
                         rec["parsed"] = parse_lines(data if isinstance(data, dict) else {})
                     append(self.out_dir, r.kaisai_date, rec)
@@ -240,6 +243,12 @@ class Logger:
             if self.last_refresh is None or (now - self.last_refresh).total_seconds() >= RACELIST_REFRESH_SEC:
                 self.refresh(now)
             due, upcoming = [], []
+            if self.forecaster is not None:
+                try:
+                    upcoming.extend(self.forecaster.tick(self.races.values(),now,end))
+                except Exception as error:
+                    self.record_error(now.strftime('%Y%m%d'),None,'research_prediction',error,self.clock())
+                    self.forecaster.close();self.forecaster=None
             for t, r, off in self.events(now, end):
                 if off < 0:
                     if now > r.close:  # 締切を過ぎた締切前の時点は取らない
@@ -280,8 +289,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="data")
     ap.add_argument("--window-min", type=float, default=12.0)
+    ap.add_argument("--research-bundle",help="Optional frozen research inference bundle; collection also works without it")
     a = ap.parse_args(argv)
-    Logger(NetkeirinClient(), a.out_dir, a.window_min).run()
+    forecaster=None
+    if a.research_bundle:
+        sys.path.insert(0,os.path.join(os.path.abspath(a.research_bundle),'source'))
+        from keirin_lab.live_worker import LiveWorker
+        try:
+            forecaster=LiveWorker(a.research_bundle,a.out_dir)
+            print(f"research bundle loaded: {len(forecaster.models)} independent models; frozen_at={forecaster.frozen_at}; research only")
+        except Exception as error:
+            print(f"research bundle unavailable; capture continues: {type(error).__name__}: {str(error)[:200]}")
+    try:
+        Logger(NetkeirinClient(), a.out_dir, a.window_min,forecaster=forecaster).run()
+    finally:
+        if forecaster is not None:forecaster.close()
     return 0
 
 

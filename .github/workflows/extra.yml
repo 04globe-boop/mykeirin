@@ -76,6 +76,14 @@ jobs:
             [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
           done
 
+      - name: Settle yesterday's frozen forecasts
+        if: success() && github.event.inputs.month == ''
+        continue-on-error: true
+        run: |
+          D=$(date -d yesterday +%Y%m%d)
+          python logger/research_assets.py settle --repo "$DATA_REPO" --day "$D" --extra "extra/extra_${{ steps.t.outputs.ym }}.jsonl.gz"
+          python logger/research_assets.py upload --repo "$DATA_REPO" --history
+
       - name: Chain next run
         if: success() && github.event.inputs.month != ''
         env:

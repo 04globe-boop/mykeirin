@@ -70,7 +70,7 @@ def test_normal_window():
     ck = FakeClock(t0)
     races = [mk("202610192701", t0 + timedelta(minutes=6)), mk("202610192702", t0 + timedelta(minutes=70))]
     cl = FakeClient(ck, races)
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as d:
         s = Logger(cl, d, 12, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
         recs = read(os.path.join(d, "odds_20261019.jsonl.gz"))
         odds = [(r["race_id"][-2:], r["label"]) for r in recs if r["type"] == "odds"]
@@ -85,7 +85,7 @@ def test_normal_window():
                 lag = (datetime.fromisoformat(r["fetched_at"]) - datetime.fromisoformat(r["target_at"])).total_seconds()
                 assert 0 <= lag <= 5, (r["label"], lag)
         lines = [r for r in recs if r["type"] == "lines"]
-        assert {r["label"] for r in lines} == {"-5", "-60"}
+        assert {r["label"] for r in lines} == {"-7", "-5", "-60"}
         assert lines[0]["parsed"][0] == ["5", "3"]
         assert s["error"] == 0
 
@@ -95,7 +95,7 @@ def test_resume_no_duplicates():
     ck = FakeClock(t0)
     races = [mk("202610192701", t0 + timedelta(minutes=20))]
     cl = FakeClient(ck, races)
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as d:
         Logger(cl, d, 8, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
         n1 = len(cl.calls)
         Logger(cl, d, 8, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
@@ -112,7 +112,7 @@ def test_post_close_final():
     ck = FakeClock(t0)
     races = [mk("202610192701", t0 - timedelta(minutes=10))]  # 10分前に締切済み
     cl = FakeClient(ck, races)
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as d:
         Logger(cl, d, 5, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
         recs = read(os.path.join(d, "odds_20261019.jsonl.gz"))
         assert any(r["type"] == "odds" and r["label"] == "+8" for r in recs)
@@ -125,7 +125,7 @@ def test_final_stops_retries():
     races = [mk("202610192701", t0 - timedelta(minutes=9))]
     cl = FakeClient(ck, races)
     cl.odds = lambda rid: (cl._tick(), {"official_dt": "2026-10-19 14:57:00"})[1]
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as d:
         Logger(cl, d, 10, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
         recs = read(os.path.join(d, "odds_20261019.jsonl.gz"))
         labels = [r["label"] for r in recs if r["type"] == "odds"]
@@ -137,10 +137,30 @@ def test_old_misses_not_written():
     ck = FakeClock(t0)
     races = [mk("202610192701", t0 - timedelta(hours=3))]
     cl = FakeClient(ck, races)
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as d:
         Logger(cl, d, 3, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
         recs = read(os.path.join(d, "odds_20261019.jsonl.gz"))
         assert not [r for r in recs if r["type"] == "miss"]
+
+
+def test_prediction_hook_wakes_before_cutoff_and_uses_completed_captures():
+    t0 = datetime(2026, 10, 19, 15, 0, 0, tzinfo=JST)
+    ck=FakeClock(t0);close=t0+timedelta(minutes=10)
+    class Hook:
+        def __init__(self):self.calls=[]
+        def tick(self,races,now,end):
+            target=close-timedelta(minutes=5,seconds=20)
+            if now<target:return [target]
+            if not self.calls:self.calls.append(now)
+            return []
+    hook=Hook();client=FakeClient(ck,[mk('202610192701',close)])
+    with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as d:
+        Logger(client,d,6,clock=ck.now,sleeper=ck.sleep,log=lambda *_:None,forecaster=hook).run()
+        assert close-timedelta(minutes=5,seconds=20)<=hook.calls[0]<close-timedelta(minutes=5)
+        recs=read(os.path.join(d,'odds_20261019.jsonl.gz'))
+        first_list=next(v for v in recs if v['type']=='racelist')
+        assert datetime.fromisoformat(first_list['fetched_at'])>=t0+timedelta(seconds=1)
+        assert any(v['type']=='entries' and v['label']=='-7' and datetime.fromisoformat(v['fetched_at'])<hook.calls[0] for v in recs)
 
 
 if __name__ == "__main__":

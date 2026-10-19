@@ -180,6 +180,7 @@ def main(argv=None) -> int:
                     n_err += 1
                     continue
                 code, body = futs[kind].result()
+                now = datetime.now(JST).isoformat(timespec="microseconds")
                 if code != 200:
                     write({"type": "error", "what": kind, "race_id": rid, "url": url, "status": code,
                            "error": body if isinstance(body, str) else None, "fetched_at": now})
