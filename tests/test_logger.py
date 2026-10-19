@@ -119,6 +119,30 @@ def test_post_close_final():
         assert all(r["label"] != "-1" for r in recs if r["type"] == "odds")
 
 
+def test_final_stops_retries():
+    t0 = datetime(2026, 10, 19, 15, 0, 0, tzinfo=JST)
+    ck = FakeClock(t0)
+    races = [mk("202610192701", t0 - timedelta(minutes=9))]
+    cl = FakeClient(ck, races)
+    cl.odds = lambda rid: (cl._tick(), {"official_dt": "2026-10-19 14:57:00"})[1]
+    with tempfile.TemporaryDirectory() as d:
+        Logger(cl, d, 10, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
+        recs = read(os.path.join(d, "odds_20261019.jsonl.gz"))
+        labels = [r["label"] for r in recs if r["type"] == "odds"]
+        assert labels == ["+8"], labels  # 確定値が取れたので +15 は取らない
+
+
+def test_old_misses_not_written():
+    t0 = datetime(2026, 10, 19, 18, 0, 0, tzinfo=JST)
+    ck = FakeClock(t0)
+    races = [mk("202610192701", t0 - timedelta(hours=3))]
+    cl = FakeClient(ck, races)
+    with tempfile.TemporaryDirectory() as d:
+        Logger(cl, d, 3, clock=ck.now, sleeper=ck.sleep, log=lambda *_: None).run()
+        recs = read(os.path.join(d, "odds_20261019.jsonl.gz"))
+        assert not [r for r in recs if r["type"] == "miss"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

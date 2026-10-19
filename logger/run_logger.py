@@ -29,10 +29,14 @@ from netkeirin import NetkeirinClient, parse_lines  # noqa: E402
 
 JST = ZoneInfo("Asia/Tokyo")
 PRE_OFFSETS = [-60, -30, -20, -15, -10, -7, -5, -3, -2, -1]  # 締切からの分
-POST_OFFSETS = [8]
+POST_OFFSETS = [8, 15, 30]  # 確定値（official_dt あり）が取れた時点で以降は取らない
 CARD_OFFSETS = {-60, -5}  # 並び予想・出走表も取る時点
 RACELIST_REFRESH_SEC = 300
 POST_DEADLINE_MIN = 180  # 締切後この分数までは確定オッズを取りに行く
+MISS_RECORD_WINDOW_MIN = 30  # これより古い予定時刻の取り逃しはファイルに書かない（初回起動時のノイズ防止）
+RACELIST_FIELDS = ("race_id", "jyo_cd", "jyo", "race_name", "jyoken", "kaisai_date", "kaisai_date_1st", "nichiji",
+                   "tosu", "kyori", "start", "close", "race_status", "sale_status", "tenko", "update_datetime")
+RACELIST_HASH_FIELDS = ("race_id", "start", "close", "tosu", "race_status")
 
 
 def tolerance_min(offset: int) -> float:
@@ -61,6 +65,7 @@ class Race:
 @dataclass
 class State:
     captured: set = field(default_factory=set)  # (race_id, type, label)
+    finals: set = field(default_factory=set)  # 確定オッズ（official_dt あり）を取得済みのレース
     racelist_hash: dict = field(default_factory=dict)  # kaisai_date -> hash
 
 
@@ -105,6 +110,8 @@ def load_state(out_dir: str, days: list[str]) -> State:
                 if t in ("odds", "lines", "entries", "miss"):
                     typ = "odds" if t == "miss" else t
                     st.captured.add((rec.get("race_id"), typ, rec.get("label")))
+                    if t == "odds" and str(rec.get("label", "")).startswith("+") and (rec.get("data") or {}).get("official_dt"):
+                        st.finals.add(rec.get("race_id"))
                 elif t == "racelist":
                     st.racelist_hash[rec.get("kaisai_date")] = rec.get("hash")
     return st
@@ -145,8 +152,9 @@ class Logger:
             except Exception as e:  # noqa: BLE001
                 self.record_error(d, None, "racelist", e, now)
                 continue
-            compact = sorted(raw, key=lambda r: r.get("race_id", ""))
-            h = hashlib.sha256(json.dumps(compact, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+            compact = sorted(({k: r.get(k) for k in RACELIST_FIELDS} for r in raw), key=lambda r: r.get("race_id") or "")
+            key = [[r.get(k) for k in RACELIST_HASH_FIELDS] for r in compact]
+            h = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()[:16]
             if self.state.racelist_hash.get(d) != h:
                 append(self.out_dir, d, {"type": "racelist", "kaisai_date": d, "fetched_at": iso(now), "hash": h, "data": compact})
                 self.state.racelist_hash[d] = h
@@ -171,6 +179,8 @@ class Logger:
                     continue
                 ev.append((t, r, off))
             for off in POST_OFFSETS:
+                if r.race_id in self.state.finals:
+                    break
                 if (r.race_id, "odds", label_of(off)) in self.state.captured:
                     continue
                 t = r.close + timedelta(minutes=off)
@@ -189,6 +199,8 @@ class Logger:
             got = self.clock()
             append(self.out_dir, r.kaisai_date, {"type": "odds", **base, "fetched_at": iso(got), "data": od})
             self.counts["odds"] += 1
+            if off > 0 and isinstance(od, dict) and od.get("official_dt"):
+                self.state.finals.add(r.race_id)
         except Exception as e:  # noqa: BLE001
             self.record_error(r.kaisai_date, r.race_id, f"odds{lab}", e, now)
             return
@@ -211,9 +223,11 @@ class Logger:
 
     def miss(self, r: Race, off: int, target: datetime, now: datetime, reason: str) -> None:
         lab = label_of(off)
+        self.state.captured.add((r.race_id, "odds", lab))
+        if now - target > timedelta(minutes=MISS_RECORD_WINDOW_MIN):
+            return  # 古い予定時刻（ロガーが動いていなかった時間帯）は記録しない
         append(self.out_dir, r.kaisai_date, {"type": "miss", "race_id": r.race_id, "label": lab,
                                              "target_at": iso(target), "noticed_at": iso(now), "reason": reason})
-        self.state.captured.add((r.race_id, "odds", lab))
         self.counts["miss"] += 1
 
     def run(self) -> dict:
