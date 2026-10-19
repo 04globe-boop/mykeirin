@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests
-      - run: python tools/probe.py ${{ github.event.inputs.targets }}
+      - run: python tools/probe.py
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
       - name: Upload
         run: |
           gh release view probe --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create probe --repo "$DATA_REPO" --title probe --notes "ページ構造の確認用"
