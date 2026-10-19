@@ -1,0 +1,77 @@
+name: odds-logger
+
+on:
+  schedule:
+    # UTC 22:00-15:59 = JST 07:00-00:59 の10分おき
+    - cron: "*/10 22-23,0-15 * * *"
+  workflow_dispatch:
+    inputs:
+      window_min:
+        description: "この起動で動く分数"
+        required: false
+        default: "12"
+
+concurrency:
+  group: odds-logger
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Tokyo
+  # 記録データの保存先（非公開リポジトリ）。書き込みには secrets.DATA_REPO_TOKEN を使う
+  DATA_REPO: ${{ github.repository_owner }}/mykeirin2
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Download today's file from data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          mkdir -p data
+          for D in $(date +%Y%m%d) $( [ "$(date +%-H)" -lt 3 ] && date -d yesterday +%Y%m%d ); do
+            TAG="odds-${D:0:4}-${D:4:2}"
+            gh release download "$TAG" --repo "$DATA_REPO" -p "odds_${D}.jsonl.gz" -D data --clobber 2>/dev/null || echo "no existing file for $D"
+          done
+
+      - name: Run logger
+        run: python logger/run_logger.py --out-dir data --window-min "${{ github.event.inputs.window_min || '12' }}"
+
+      - name: Upload to data repo
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          for F in data/odds_*.jsonl.gz; do
+            [ -e "$F" ] || continue
+            D=$(basename "$F" | sed -E 's/odds_([0-9]{8}).*/\1/')
+            TAG="odds-${D:0:4}-${D:4:2}"
+            gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "odds ${D:0:4}-${D:4:2}" --notes "締切前オッズの記録（開催日ごとのファイル）"
+            gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
+          done
+
+      - name: Daily heartbeat commit
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+          mkdir -p status
+          if [ "$(cat status/last_day.txt 2>/dev/null)" != "$TODAY" ]; then
+            echo "$TODAY" > status/last_day.txt
+            git config user.name "odds-logger"
+            git config user.email "actions@users.noreply.github.com"
+            git add status/last_day.txt
+            git commit -m "heartbeat $TODAY"
+            git pull --rebase && git push
+          fi
