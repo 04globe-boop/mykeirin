@@ -9,7 +9,7 @@ on:
       window_min:
         description: "この起動で動く分数"
         required: false
-        default: "12"
+        default: "25"
 
 concurrency:
   group: odds-logger
@@ -17,6 +17,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write   # 次の起動を自分で予約するため
 
 env:
   TZ: Asia/Tokyo
@@ -74,4 +75,18 @@ jobs:
             git add status/last_day.txt
             git commit -m "heartbeat $TODAY"
             git pull --rebase && git push
+          fi
+
+      - name: Chain next run
+        # 定時起動は遅延・欠落があるため、開催時間中は終了時に次の起動を自分で予約して途切れなく回す。
+        # 定時起動は、この連鎖が切れたときの再開役。
+        if: success() || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          H=$(date +%-H)
+          if [ "$H" -ge 7 ]; then
+            gh api -X POST "repos/${{ github.repository }}/actions/workflows/odds_logger.yml/dispatches" -f ref=main -f 'inputs[window_min]=25' && echo "next run dispatched"
+          else
+            echo "outside operating hours; not chaining"
           fi
