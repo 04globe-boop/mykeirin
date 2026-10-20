@@ -1,4 +1,4 @@
-import json,os,sys,tempfile,unittest
+import json,os,sys,tempfile,unittest,sqlite3
 from datetime import datetime,timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -68,6 +68,21 @@ def settle_day(bundle,out,extra,day):return {'cohort':VALUE,'settled':1}
         self.assertEqual(result['summaries']['gnn']['settled_races'],20)
         self.assertIn('performance_sealed_until',result)
         self.assertNotIn('brier',result['summaries']['gnn'])
+
+    def test_frozen_legacy_summary_uses_one_japanese_day_across_utc_midnight(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            path=Path(tmp)/'ledger.sqlite';db=sqlite3.connect(path)
+            db.execute('CREATE TABLE predictions(race_id TEXT,model_id TEXT,close_at TEXT,payload TEXT,synthetic INTEGER)')
+            db.execute('CREATE TABLE labels(race_id TEXT)')
+            for i,close in enumerate(('2026-10-19T23:50:00+00:00','2026-10-20T04:25:00+00:00')):
+                db.execute('INSERT INTO predictions VALUES(?,?,?,?,0)',(str(i),'fixed',close,json.dumps({'primary_horizon_eligible':True})))
+                db.execute('INSERT INTO labels VALUES(?)',(str(i),))
+            db.commit();db.close()
+            report={'summaries':{'gnn':{'days':2,'primary_days':2,'nll':4.1}}}
+            research_runtime.normalize_summary_days(report,path,{'candidate_ids':{'gnn':'fixed'}})
+            self.assertEqual(report['summaries']['gnn']['days'],1)
+            self.assertEqual(report['summaries']['gnn']['primary_days'],1)
+            self.assertEqual(report['summaries']['gnn']['nll'],4.1)
 
 
 if __name__=='__main__':unittest.main()

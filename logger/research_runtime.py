@@ -54,7 +54,7 @@ def protect_test_report(report,day,*,now=None):
     cfg=json.loads(path.read_text(encoding='utf-8'));iso_day=f'{day[:4]}-{day[4:6]}-{day[6:8]}'
     now=now or datetime.now(timezone.utc)
     if cfg['test_start']<=iso_day<=cfg['test_end'] and now<datetime.fromisoformat(cfg['test_unlock_at']):
-        coverage={'settled_races','primary_settled_races','primary_days','days','synthetic','adoption'}
+        coverage={'settled_races','primary_settled_races','primary_days','days','duration_timezone','synthetic','adoption'}
         for name,summary in report.get('summaries',{}).items():
             report['summaries'][name]={k:v for k,v in summary.items() if k in coverage}
             report['summaries'][name].update(nll=None,primary_nll=None)
@@ -62,11 +62,35 @@ def protect_test_report(report,day,*,now=None):
     return report
 
 
+def normalize_summary_days(report,ledger_path,manifest):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import sqlite3
+    if not report.get('summaries'):return report
+    def span(values):
+        days={datetime.fromisoformat(v).astimezone(ZoneInfo('Asia/Tokyo')).date() for v in values}
+        return (max(days)-min(days)).days+1 if days else 0
+    db=sqlite3.connect('file:'+Path(ledger_path).resolve().as_posix()+'?mode=ro',uri=True)
+    try:
+        for name,summary in report['summaries'].items():
+            rows=db.execute('''SELECT p.close_at,p.payload,p.synthetic FROM predictions p JOIN labels l USING(race_id)
+                               WHERE p.model_id=?''',(manifest['candidate_ids'][name],)).fetchall()
+            summary['days']=span(row[0] for row in rows)
+            summary['primary_days']=span(row[0] for row in rows if not row[2] and json.loads(row[1]).get('primary_horizon_eligible') is True)
+            summary['duration_timezone']='Asia/Tokyo'
+    finally:db.close()
+    return report
+
+
 def settle_bundles(bundles,out_dir,extra,day):
     reports={};out=Path(out_dir)
     for name,bundle in bundles.items():
         try:
-            report=protect_test_report(bundle_module(bundle,'settlement').settle_day(bundle,out,extra,day),day)
+            report=bundle_module(bundle,'settlement').settle_day(bundle,out,extra,day)
+            if report.get('summaries'):
+                manifest=json.loads((Path(bundle)/'bundle.json').read_text(encoding='utf-8'))
+                normalize_summary_days(report,out/f'forward_{day}.sqlite',manifest)
+            report=protect_test_report(report,day)
             reports[name]=report
             (out/f'forward_report_{name}_{day}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         except Exception as error:
