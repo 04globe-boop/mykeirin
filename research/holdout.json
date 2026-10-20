@@ -1,0 +1,40 @@
+{
+  "registration_id": "PROSPECTIVE-HOLDOUT-001",
+  "registered_date_jst": "2026-10-20",
+  "timezone": "Asia/Tokyo",
+  "base_bundle": {
+    "tag": "research-model-v2",
+    "archive_sha256": "d548416e588589328098a07342fc651d3c32b28c922c1b06b18acd049634fbce",
+    "seed": 17
+  },
+  "market_calibration_start": "2026-10-21",
+  "market_calibration_end": "2026-11-19",
+  "market_freeze_date": "2026-11-20",
+  "market_label_cutoff": "2026-11-20T00:00:00+09:00",
+  "market_min_matched_races": 1000,
+  "market_min_observed_days": 20,
+  "market_min_meetings": 30,
+  "market_fusion_components": {
+    "O+M": ["gbdt", "market"],
+    "O+R+M": ["gbdt", "gnn", "market"]
+  },
+  "market_fusion_rule": "Fixed 0.1 simplex and temperatures 0.8/1/1.25; fit complete-case actual pre-cutoff OOF calibration records only. Freeze before test; if unavailable H-M remains untested, with no replacement period or model chosen after test scores.",
+  "test_start": "2026-11-21",
+  "test_end": "2027-01-19",
+  "test_unlock_at": "2027-01-20T03:00:00+09:00",
+  "min_test_races": 3000,
+  "min_test_days": 60,
+  "min_test_meetings": 100,
+  "comparisons": {
+    "H-O": {"candidate": "gbdt", "references": ["score_pl", "uniform"]},
+    "H-R": {"route": "fusion", "family": "gnn", "candidate": "gbdt+gnn", "references": ["gbdt"]},
+    "H-M": {"candidate": "O+R+M", "references": ["market", "gbdt+gnn"], "requires_market_freeze": true}
+  },
+  "comparison_rule": "Each hypothesis must pass every listed reference at protocol alpha/3; intersection-union, no favorable reference selection. Other R families remain exploratory on this holdout, not discarded.",
+  "missingness": "O/R comparison on matched primary-horizon predictions; market comparison on predeclared matched complete-market subset. Report all scheduled, excluded and unmatched counts; never silently equate denominators.",
+  "boundary_rule": "Exclude meetings overlapping model or fusion training/calibration; do not fit on any test labels. Previous published outcomes may update numerical history for later races, without updating frozen weights.",
+  "no_peeking": "Operational checks may inspect capture times, identities, missingness and label availability. Do not inspect aggregate predictive performance for the test window before unlock; no interim selection, early success stopping or effect-driven extension.",
+  "power_basis": "Development GNN-fusion meeting variance suggests approximately 2191 races for 90% power at assumed true 0.10 nats improvement over delta=0.005. Raised targets are 3000 races/100 meetings/60 days. This does not guarantee power for smaller effects or for H-M, whose market variance is unknown. Fixed end with insufficient count remains inconclusive.",
+  "adoption": "inconclusive until every unchanged charter gate passes, including historical provenance and all registered component probes",
+  "hypotheses_dropped": []
+}

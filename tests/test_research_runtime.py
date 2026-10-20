@@ -60,5 +60,14 @@ def settle_day(bundle,out,extra,day):return {'cohort':VALUE,'settled':1}
             self.assertEqual(set(installed),{'v1'})
             self.assertIn('v2',json.loads((root/'runtime/preparation.json').read_text())['failures'])
 
+    def test_reserved_period_reports_coverage_without_interim_performance(self):
+        raw={'summaries':{'gnn':{'nll':4.1,'primary_nll':4.0,'brier':0.9,'settled_races':20}}}
+        result=research_runtime.protect_test_report(raw,'20261121',now=datetime(2026,12,1,tzinfo=timezone.utc))
+        self.assertIsNone(result['summaries']['gnn']['nll'])
+        self.assertIsNone(result['summaries']['gnn']['primary_nll'])
+        self.assertEqual(result['summaries']['gnn']['settled_races'],20)
+        self.assertIn('performance_sealed_until',result)
+        self.assertNotIn('brier',result['summaries']['gnn'])
+
 
 if __name__=='__main__':unittest.main()

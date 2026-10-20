@@ -46,11 +46,27 @@ class ResearchGroup:
         for worker in self.workers:worker.close()
 
 
+def protect_test_report(report,day,*,now=None):
+    from datetime import datetime,timezone
+    path=Path(__file__).resolve().parents[1]/'research/holdout.json'
+    lock=json.loads(path.with_suffix('.lock.json').read_text(encoding='utf-8'))
+    if hashlib.sha256(path.read_bytes()).hexdigest()!=lock['sha256']:raise ValueError('Holdout guard differs from canonical lock')
+    cfg=json.loads(path.read_text(encoding='utf-8'));iso_day=f'{day[:4]}-{day[4:6]}-{day[6:8]}'
+    now=now or datetime.now(timezone.utc)
+    if cfg['test_start']<=iso_day<=cfg['test_end'] and now<datetime.fromisoformat(cfg['test_unlock_at']):
+        coverage={'settled_races','primary_settled_races','primary_days','days','synthetic','adoption'}
+        for name,summary in report.get('summaries',{}).items():
+            report['summaries'][name]={k:v for k,v in summary.items() if k in coverage}
+            report['summaries'][name].update(nll=None,primary_nll=None)
+        report['performance_sealed_until']=cfg['test_unlock_at']
+    return report
+
+
 def settle_bundles(bundles,out_dir,extra,day):
     reports={};out=Path(out_dir)
     for name,bundle in bundles.items():
         try:
-            report=bundle_module(bundle,'settlement').settle_day(bundle,out,extra,day)
+            report=protect_test_report(bundle_module(bundle,'settlement').settle_day(bundle,out,extra,day),day)
             reports[name]=report
             (out/f'forward_report_{name}_{day}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         except Exception as error:
