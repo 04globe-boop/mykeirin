@@ -28,6 +28,7 @@ DEV = ("2025-01-01", "2025-12-31")
 TEST = ("2026-01-01", "2026-08-31")
 HF = None  # (race_id, 車番) -> 並び・市場（tools/hist_features.py の出力）。--hist-features で読み込む
 USE_LINES = USE_MARKET = False
+LINES_SAMPLE = False  # 並びがあるレースだけに絞るが、並びの特徴は足さない（--lines と同じ標本で比べるため）
 STYLE = False  # 脚質（逃・両・追）を基準に入れるか。--style で有効（結果を見た後に加えた比較。最終テストでのみ判定）
 
 
@@ -75,9 +76,9 @@ def build(races, final: bool):
             if d1 >= TEST[0] and not final:
                 continue
             extra = {}
-            if USE_LINES or USE_MARKET:
+            if USE_LINES or USE_MARKET or LINES_SAMPLE:
                 h = HF.get((rid1, r1["car_no"]))
-                if h is None or (USE_LINES and not h["line_pos"]) or (USE_MARKET and not h["mkt_top3"]):
+                if h is None or ((USE_LINES or LINES_SAMPLE) and not h["line_pos"]) or (USE_MARKET and not h["mkt_top3"]):
                     continue  # 並び・市場がないレースは、どのモデルの比較からも外す（同じ標本で比べるため）
                 if USE_LINES:
                     extra.update({"lpos_" + h["line_pos"]: 1.0, "lsize_" + str(min(int(h["line_size"]), 4)): 1.0,
@@ -145,11 +146,12 @@ def main(argv=None):
     ap.add_argument("--style", action="store_true")
     ap.add_argument("--hist-features", help="tools/hist_features.py の出力（並び・市場）")
     ap.add_argument("--lines", action="store_true", help="基準に並び（ライン内の位置・車数・ライン数・競り）を加える")
+    ap.add_argument("--lines-sample", action="store_true", help="並びがあるレースだけに絞る（特徴は足さない）。--lines との同じ標本での比較用")
     ap.add_argument("--market", action="store_true", help="基準に市場の評価（確定オッズの3着以内・1着の確率）を加える（B1）")
     a = ap.parse_args(argv)
-    global STYLE, HF, USE_LINES, USE_MARKET
-    STYLE, USE_LINES, USE_MARKET = a.style, a.lines, a.market
-    if a.lines or a.market:
+    global STYLE, HF, USE_LINES, USE_MARKET, LINES_SAMPLE
+    STYLE, USE_LINES, USE_MARKET, LINES_SAMPLE = a.style, a.lines, a.market, a.lines_sample
+    if a.lines or a.market or a.lines_sample:
         HF = {}
         with gzip.open(a.hist_features, "rt", encoding="utf-8") as f:
             for r in csv.DictReader(f):
