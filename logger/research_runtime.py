@@ -21,6 +21,10 @@ class ResearchGroup:
         for bundle in bundles:
             try:
                 worker=bundle_module(bundle,'live_worker').LiveWorker(bundle,out_dir,log=log)
+                if hasattr(worker,'manifest'):
+                    from research_inference import TimedInference,ModelProxy
+                    worker._bounded_inference=TimedInference(bundle)
+                    worker.models={name:ModelProxy(name,model,worker._bounded_inference) for name,model in worker.models.items()}
                 self.workers.append(worker)
                 log(f'research bundle loaded: {Path(bundle).parent.name}; {len(worker.models)} independent models; frozen_at={worker.frozen_at}; research only')
             except Exception as error:
@@ -39,11 +43,16 @@ class ResearchGroup:
         for worker in list(self.workers):
             try:upcoming.extend(worker.tick(races,now,end))
             except Exception as error:
-                self.failure(worker.root,error);worker.close();self.workers.remove(worker)
+                self.failure(worker.root,error);self.close_worker(worker);self.workers.remove(worker)
         return upcoming
 
     def close(self):
-        for worker in self.workers:worker.close()
+        for worker in self.workers:self.close_worker(worker)
+
+    @staticmethod
+    def close_worker(worker):
+        if hasattr(worker,'_bounded_inference'):worker._bounded_inference.close()
+        worker.close()
 
 
 def protect_test_report(report,day,*,now=None):

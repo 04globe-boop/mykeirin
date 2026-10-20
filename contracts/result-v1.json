@@ -1,0 +1,15 @@
+{
+  "contract": "collector-extra-result-v1",
+  "synthetic": true,
+  "record": {
+    "type": "k",
+    "race_id": "202610202701",
+    "fetched_at": "2026-10-20T12:00:00.000001+09:00",
+    "url": "https://keirin.kdreams.jp/fixture/",
+    "data": {
+      "page_title": "2026年10月20日 テスト 1R 結果",
+      "result": [["予 想", "着 順", "車 番", "選手名", "決ま り手"], ["", "1", "2", "試験 選手二", "差"], ["", "2", "1", "試験 選手一", ""], ["", "3", "3", "試験 選手三", ""]]
+    }
+  },
+  "expected_top_three_cars": ["2", "1", "3"]
+}
