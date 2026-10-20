@@ -17,6 +17,7 @@ import gzip
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -34,32 +35,45 @@ VENUES = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 class Fetcher:
-    """ドメインごとに間隔を空けて取得する。失敗は3回まで再試行。"""
+    """1つのサイトへの取得。リクエストの開始間隔を空け（interval 秒）、同時に開く接続数を max_conc までに抑える。
+    失敗（通信エラー・5xx）は3回まで再試行する。"""
 
-    def __init__(self, interval: float):
-        self.s = requests.Session()
-        self.s.headers.update({"User-Agent": UA, "Accept-Language": "ja"})
+    def __init__(self, interval: float, max_conc: int = 1):
         self.interval = interval
-        self.last: dict[str, float] = {}
+        self.local = threading.local()
+        self.lock = threading.Lock()
+        self.next_slot = 0.0
+        self.sem = threading.Semaphore(max_conc)
+
+    def _session(self):
+        if not hasattr(self.local, "s"):
+            self.local.s = requests.Session()
+            self.local.s.headers.update({"User-Agent": UA, "Accept-Language": "ja"})
+        return self.local.s
+
+    def _wait_slot(self):
+        with self.lock:
+            now = time.monotonic()
+            t = max(now, self.next_slot)
+            self.next_slot = t + self.interval
+        if t > now:
+            time.sleep(t - now)
 
     def get(self, url: str):
-        host = url.split("/")[2]
         err = None
-        for attempt in range(3):
-            wait = self.interval - (time.monotonic() - self.last.get(host, 0))
-            if wait > 0:
-                time.sleep(wait)
-            self.last[host] = time.monotonic()
-            try:
-                r = self.s.get(url, timeout=30)
-                if r.status_code >= 500:
-                    err = f"HTTP {r.status_code}"
+        with self.sem:
+            for attempt in range(3):
+                self._wait_slot()
+                try:
+                    r = self._session().get(url, timeout=30)
+                    if r.status_code >= 500:
+                        err = f"HTTP {r.status_code}"
+                        time.sleep(3 * (attempt + 1))
+                        continue
+                    return r.status_code, r.content
+                except requests.RequestException as e:
+                    err = str(e)[:200]
                     time.sleep(3 * (attempt + 1))
-                    continue
-                return r.status_code, r.content
-            except requests.RequestException as e:
-                err = str(e)[:200]
-                time.sleep(3 * (attempt + 1))
         return None, err
 
 
@@ -119,7 +133,8 @@ def main(argv=None) -> int:
     ap.add_argument("--window-min", type=float, default=100)
     ap.add_argument("--out-dir", default="extra")
     ap.add_argument("--max-minutes", type=float, default=320)
-    ap.add_argument("--interval", type=float, default=1.0, help="同じサイトへのリクエスト間隔（秒）")
+    ap.add_argument("--interval", type=float, default=0.4, help="同じサイトへのリクエストの開始間隔（秒）")
+    ap.add_argument("--conc", type=int, default=3, help="同じサイトへ同時に開く接続数")
     ap.add_argument("--status-file")
     a = ap.parse_args(argv)
 
@@ -139,8 +154,8 @@ def main(argv=None) -> int:
     path = os.path.join(a.out_dir, f"extra_pre_{days[0].strftime('%Y%m%d')}.jsonl.gz" if a.pre else f"extra_{ym}.jsonl.gz")
     have = done_keys(path)
     nk = NetkeirinClient(min_interval=0.8)
-    fetchers = {"k": Fetcher(a.interval), "op": Fetcher(a.interval)}  # サイトごとに別々に取得（2つを同時に進める）
-    pool = ThreadPoolExecutor(max_workers=2)
+    fetchers = {"k": Fetcher(a.interval, a.conc), "op": Fetcher(a.interval, a.conc)}  # サイトごとに別々に制御
+    pool = ThreadPoolExecutor(max_workers=2 * a.conc)
     t0 = time.monotonic()
     today = datetime.now(JST).date()
     n_new = n_err = 0
@@ -164,6 +179,7 @@ def main(argv=None) -> int:
             write({"type": "error", "what": "racelist", "kaisai_date": ds, "error": str(e)[:300]})
             n_err += 1
             continue
+        targets = []
         for race in races:
             rid = race.get("race_id")
             if not rid:
@@ -177,21 +193,24 @@ def main(argv=None) -> int:
                 lead = (close - datetime.now(JST)).total_seconds() / 60
                 if not (a.lead_min <= lead <= a.window_min):
                     continue
+            for kind, url, parser in (("k", kdreams_url(race), parse_kdreams), ("op", oddspark_url(race), parse_oddspark)):
+                if (kind, rid) not in have:
+                    targets.append((race, kind, url, parser))
+        batch = 3 * a.conc  # 何件かずつまとめて並行に取得し、書き込みは元の順番で行う
+        for i in range(0, len(targets), batch):
             if (time.monotonic() - t0) / 60 > a.max_minutes:
                 status("time_limit", new=n_new, errors=n_err, at=ds)
                 print(json.dumps({"stopped": "time limit", "new": n_new, "errors": n_err, "at": ds}))
                 return 0
-            todo = [(kind, url, parser) for kind, url, parser in
-                    (("k", kdreams_url(race), parse_kdreams), ("op", oddspark_url(race), parse_oddspark))
-                    if (kind, rid) not in have]
-            futs = {kind: pool.submit(fetchers[kind].get, url) for kind, url, _ in todo if url}
-            for kind, url, parser in todo:
-                now = datetime.now(JST).isoformat(timespec="seconds")
+            chunk = targets[i:i + batch]
+            futs = [pool.submit(fetchers[kind].get, url) if url else None for _, kind, url, _ in chunk]
+            for (race, kind, url, parser), fut in zip(chunk, futs):
+                rid = race["race_id"]
                 if url is None:
                     write({"type": "error", "what": kind, "race_id": rid, "error": "no url (venue or kaisai info missing)"})
                     n_err += 1
                     continue
-                code, body = futs[kind].result()
+                code, body = fut.result()
                 now = datetime.now(JST).isoformat(timespec="microseconds")
                 if code != 200:
                     write({"type": "error", "what": kind, "race_id": rid, "url": url, "status": code,
