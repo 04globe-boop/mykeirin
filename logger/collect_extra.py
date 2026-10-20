@@ -64,16 +64,26 @@ class Fetcher:
 
 
 def kdreams_url(race: dict) -> str | None:
+    """KドリームスのレースID＝場2桁＋開催初日8桁＋日目2桁＋00＋R2桁。
+    日目は「開催初日から数えた暦の日数」（順延があると netkeirin の nichiji とずれるため、日付から計算する）。"""
     rid = race["race_id"]
     slug = VENUES.get(rid[8:10])
     first = race.get("kaisai_date_1st") or ""
-    try:
-        nichiji = int(race.get("nichiji") or 0)
-    except ValueError:
-        nichiji = 0
-    if not slug or len(first) != 8 or not nichiji:
+    if not slug or len(first) != 8:
         return None
-    return f"https://keirin.kdreams.jp/{slug}/racedetail/{rid[8:10]}{first}{nichiji:02d}00{rid[10:12]}/"
+    try:
+        day = (datetime.strptime(rid[:8], "%Y%m%d") - datetime.strptime(first, "%Y%m%d")).days + 1
+    except ValueError:
+        return None
+    if not 1 <= day <= 9:
+        return None
+    return f"https://keirin.kdreams.jp/{slug}/racedetail/{rid[8:10]}{first}{day:02d}00{rid[10:12]}/"
+
+
+def k_page_ok(race_id: str, data: dict) -> bool:
+    """取得したページが、そのレース（日付とレース番号）のものかを確かめる。"""
+    t = (data or {}).get("page_title") or ""
+    return f"{race_id[:4]}年{race_id[4:6]}月{race_id[6:8]}日" in t and f" {int(race_id[10:12])}R " in t
 
 
 def oddspark_url(race: dict) -> str:
@@ -92,6 +102,8 @@ def done_keys(path: str) -> set:
             except ValueError:
                 continue
             if r.get("type") in ("k", "op", "k_pre", "op_pre"):
+                if r["type"].startswith("k") and not k_page_ok(r["race_id"], r.get("data")):
+                    continue  # 別のレースのページだった記録は、取り直す
                 keys.add((r["type"].replace("_pre", ""), r["race_id"]))
     return keys
 
@@ -190,6 +202,11 @@ def main(argv=None) -> int:
                     data = parser(body)
                 except Exception as e:  # noqa: BLE001
                     write({"type": "error", "what": kind, "race_id": rid, "url": url, "error": "parse: " + str(e)[:200]})
+                    n_err += 1
+                    continue
+                if kind == "k" and not k_page_ok(rid, data):
+                    write({"type": "error", "what": kind, "race_id": rid, "url": url,
+                           "error": "page mismatch: " + str(data.get("page_title"))[:120]})
                     n_err += 1
                     continue
                 write({"type": kind + ("_pre" if a.pre else ""), "race_id": rid, "url": url, "fetched_at": now,
