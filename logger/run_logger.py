@@ -5,9 +5,9 @@ GitHub Actions から10分おきに起動する前提。起動が遅れても、
 
 保存形式：data/odds_YYYYMMDD.jsonl.gz（開催日ごと、1行1レコード、gzip の追記）
   type=racelist  その日の全レース一覧（内容が変わったときだけ保存。締切の繰り下げなどを追跡）
-  type=odds      全券種のオッズ（label は締切からの分。例 "-10" は締切10分前、"+8" は締切8分後＝確定値の確認）
-  type=lines     並び予想（ライン区切り付き）。-60 と -5 で取得し、直前の変更を追跡
-  type=entries   出走表。-60 と -5 で取得し、欠車などの変更を追跡
+  type=odds      全券種のオッズ（label は締切からの分。小数の追加枠も保存し、実取得完了で時点判定）
+  type=lines     並び予想（ライン区切り付き）。-60/-7/-5で取得し、直前の変更を追跡
+  type=entries   出走表。-60/-7/-5で取得し、欠車などの変更を追跡
   type=miss      予定した時点を取り逃したことの記録
   type=error     通信エラーなど
 """
@@ -28,7 +28,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from netkeirin import NetkeirinClient, parse_lines  # noqa: E402
 
 JST = ZoneInfo("Asia/Tokyo")
-PRE_OFFSETS = [-60, -30, -20, -15, -10, -7, -5, -3, -2, -1]  # 締切からの分
+PRE_OFFSETS = [-60, -30, -20, -15, -10, -7, -5.5, -5, -3, -2.5, -2, -1.5, -1]  # 締切からの分
+PRE_CUTOFF_HORIZONS = {-5.5: 5, -2.5: 2, -1.5: 1}
+PRE_CUTOFF_GRACE_SECONDS = 6.0  # 取得はtarget+6秒まで。T-5の実発行開始まで4秒を残す。
+PRE_CUTOFF_BUDGET_SECONDS = 5.0
+CAPTURE_SCHEDULE_VERSION = 'precutoff-30s-v1'
 POST_OFFSETS = [8, 15, 30]  # 確定値（official_dt あり）が取れた時点で以降は取らない
 CARD_OFFSETS = {-60, -7, -5}  # -7 also supplies an actually captured card before the T-5 forecast
 RACELIST_REFRESH_SEC = 300
@@ -39,8 +43,10 @@ RACELIST_FIELDS = ("race_id", "jyo_cd", "jyo", "race_name", "jyoken", "kaisai_da
 RACELIST_HASH_FIELDS = RACELIST_FIELDS
 
 
-def tolerance_min(offset: int) -> float:
+def tolerance_min(offset: float) -> float:
     """予定時刻を過ぎてから取り直してよい時間（分）。締切に近い時点ほど狭くする。"""
+    if offset in PRE_CUTOFF_HORIZONS:
+        return PRE_CUTOFF_GRACE_SECONDS / 60
     a = abs(offset)
     if a <= 3:
         return 0.75
@@ -49,8 +55,8 @@ def tolerance_min(offset: int) -> float:
     return 5.0
 
 
-def label_of(offset: int) -> str:
-    return f"{offset:+d}"
+def label_of(offset: float) -> str:
+    return f"{offset:+g}"
 
 
 @dataclass
@@ -128,7 +134,7 @@ def iso(dt: datetime) -> str:
 
 
 class Logger:
-    def __init__(self, client, out_dir: str, window_min: float, clock=None, sleeper=None, log=print,forecaster=None):
+    def __init__(self, client, out_dir: str, window_min: float, clock=None, sleeper=None, log=print,forecaster=None,pre_capture=None):
         self.client = client
         self.out_dir = out_dir
         self.window = timedelta(minutes=window_min)
@@ -136,6 +142,7 @@ class Logger:
         self.sleep = sleeper or time.sleep
         self.log = log
         self.forecaster=forecaster
+        self.pre_capture=pre_capture
         self.races: dict[str, Race] = {}
         self.last_refresh: datetime | None = None
         self.counts = {"odds": 0, "lines": 0, "entries": 0, "miss": 0, "error": 0}
@@ -191,11 +198,15 @@ class Logger:
         ev.sort(key=lambda x: x[0])
         return ev
 
-    def fetch(self, r: Race, off: int, target: datetime, now: datetime) -> None:
+    def fetch(self, r: Race, off: float, target: datetime, now: datetime) -> None:
         lab = label_of(off)
         base = {"race_id": r.race_id, "label": lab, "target_at": iso(target),
                 "close": r.raw.get("close"), "start": r.raw.get("start"),
-                "race_status": r.raw.get("race_status"), "sale_status": r.raw.get("sale_status")}
+                "race_status": r.raw.get("race_status"), "sale_status": r.raw.get("sale_status"),
+                "capture_schedule_version": CAPTURE_SCHEDULE_VERSION}
+        if off in PRE_CUTOFF_HORIZONS:
+            self.fetch_pre_cutoff(r, off, target, base)
+            return
         try:
             od = self.client.odds(r.race_id)
             got = self.clock()
@@ -224,13 +235,46 @@ class Logger:
                     self.record_error(r.kaisai_date, r.race_id, f"{typ}{lab}", e, now)
                 self.state.captured.add((r.race_id, typ, lab))
 
-    def miss(self, r: Race, off: int, target: datetime, now: datetime, reason: str) -> None:
+    def fetch_pre_cutoff(self, r: Race, off: float, target: datetime, base: dict) -> None:
+        """Additional odds only, with no late catch-up and no ordinary retry loop."""
+        started=self.clock();wait_started=time.monotonic();deadline=target+timedelta(seconds=PRE_CUTOFF_GRACE_SECONDS)
+        if started>=deadline:
+            self.miss(r,off,target,started,'precutoff_budget_expired')
+            return
+        if self.pre_capture is None:
+            self.miss(r,off,target,started,'precutoff_worker_unavailable')
+            return
+        budget=min(PRE_CUTOFF_BUDGET_SECONDS,(deadline-started).total_seconds())
+        try:
+            od,completed=self.pre_capture.request(r.race_id,budget_seconds=budget,deadline=deadline)
+            got=datetime.fromisoformat(completed)
+            if got.tzinfo is None or not started<=got<=self.clock()<=deadline:
+                raise TimeoutError('Additional capture completed outside its reserved window')
+            cutoff=r.close-timedelta(minutes=PRE_CUTOFF_HORIZONS[off])
+            if got>=cutoff or not isinstance(od,dict) or od.get('official_dt'):
+                raise ValueError('Additional capture is late, final or malformed')
+            append(self.out_dir,r.kaisai_date,{'type':'odds',**base,
+                'capture_class':'additional_pre_cutoff','attempt_started_at':started.astimezone(JST).isoformat(timespec='microseconds'),
+                'nominal_cutoff_at':iso(cutoff),'capture_budget_seconds':budget,
+                'attempt_finished_at':self.clock().astimezone(JST).isoformat(timespec='microseconds'),
+                'capture_wait_seconds':time.monotonic()-wait_started,
+                'fetched_at':got.astimezone(JST).isoformat(timespec='microseconds'),'data':od})
+            self.state.captured.add((r.race_id,'odds',label_of(off)));self.counts['odds']+=1
+        except Exception as error:
+            self.record_error(r.kaisai_date,r.race_id,'precutoff'+label_of(off),error,self.clock())
+            self.miss(r,off,target,self.clock(),'precutoff_capture_failed',detail={
+                'attempt_started_at':started.astimezone(JST).isoformat(timespec='microseconds'),
+                'capture_budget_seconds':budget,'capture_wait_seconds':time.monotonic()-wait_started})
+
+    def miss(self, r: Race, off: float, target: datetime, now: datetime, reason: str, detail=None) -> None:
         lab = label_of(off)
         self.state.captured.add((r.race_id, "odds", lab))
         if now - target > timedelta(minutes=MISS_RECORD_WINDOW_MIN):
             return  # 古い予定時刻（ロガーが動いていなかった時間帯）は記録しない
         append(self.out_dir, r.kaisai_date, {"type": "miss", "race_id": r.race_id, "label": lab,
-                                             "target_at": iso(target), "noticed_at": iso(now), "reason": reason})
+                                             "target_at": iso(target), "noticed_at": iso(now), "reason": reason,
+                                             "capture_schedule_version": CAPTURE_SCHEDULE_VERSION,
+                                             **({'detail':detail} if detail is not None else {})})
         self.counts["miss"] += 1
 
     def run(self) -> dict:
@@ -263,14 +307,17 @@ class Logger:
                         upcoming.append(t)
                 else:
                     (due if t <= now else upcoming).append((t, r, off) if t <= now else t)
-            # 同じレースで複数の時点が同時に期限切れなら、最も締切に近い1回だけ取り、他は取り逃し扱い
+            # 追加枠は既存枠のcatchup（特に-7の出走/並び）を置き換えない。
+            # 既存枠の中では、従来どおり最も締切に近い1回だけ取る。
             by_race: dict[str, tuple] = {}
             for t, r, off in due:
-                if r.race_id not in by_race or t > by_race[r.race_id][0]:
+                prior=by_race.get(r.race_id)
+                if prior is None or (off not in PRE_CUTOFF_HORIZONS,t) > (prior[2] not in PRE_CUTOFF_HORIZONS,prior[0]):
                     by_race[r.race_id] = (t, r, off)
             for t, r, off in due:
                 if by_race[r.race_id][2] != off:
-                    self.miss(r, off, t, now, "merged_catchup")
+                    reason='precutoff_yielded_existing' if off in PRE_CUTOFF_HORIZONS else 'merged_catchup'
+                    self.miss(r, off, t, now, reason)
             for t, r, off in sorted(by_race.values(), key=lambda x: x[0]):
                 self.fetch(r, off, t, self.clock())
             now = self.clock()
@@ -299,9 +346,12 @@ def main(argv=None) -> int:
     if bundles:
         from research_runtime import ResearchGroup
         forecaster=ResearchGroup(list(dict.fromkeys(bundles)),a.out_dir)
+    from precutoff_capture import TimedOddsCapture
+    pre_capture=TimedOddsCapture()
     try:
-        Logger(NetkeirinClient(), a.out_dir, a.window_min,forecaster=forecaster).run()
+        Logger(NetkeirinClient(), a.out_dir, a.window_min,forecaster=forecaster,pre_capture=pre_capture).run()
     finally:
+        pre_capture.close()
         if forecaster is not None:forecaster.close()
     return 0
 
