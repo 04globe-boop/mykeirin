@@ -1,6 +1,16 @@
 {
-  "tag": "research-model-v1",
-  "file": "research-model-v1.zip",
-  "sha256": "e56d6922939a18c0ace38ab37e72114201930d13955e5732c5594499b58dbf33",
-  "research_only": true
+  "research_only": true,
+  "policy": "Parallel frozen cohorts. Never pool cohort counts for eligibility; v2 uses preregistered primary seed17.",
+  "bundles": {
+    "v1": {
+      "tag": "research-model-v1",
+      "file": "research-model-v1.zip",
+      "sha256": "e56d6922939a18c0ace38ab37e72114201930d13955e5732c5594499b58dbf33"
+    },
+    "v2": {
+      "tag": "research-model-v2",
+      "file": "research-model-v2.zip",
+      "sha256": "d548416e588589328098a07342fc651d3c32b28c922c1b06b18acd049634fbce"
+    }
+  }
 }

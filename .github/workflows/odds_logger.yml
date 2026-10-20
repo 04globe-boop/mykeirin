@@ -60,7 +60,7 @@ jobs:
           RESEARCH_READY: ${{ steps.research.outcome }}
         run: |
           ARGS=()
-          if [ "$RESEARCH_READY" = "success" ]; then ARGS+=(--research-bundle research-runtime/bundle); fi
+          if [ "$RESEARCH_READY" = "success" ]; then ARGS+=(--research-manifest research-runtime/active_bundles.json); fi
           python logger/run_logger.py --out-dir data --window-min "${{ github.event.inputs.window_min || '12' }}" "${ARGS[@]}"
 
       - name: Upload prospective research records

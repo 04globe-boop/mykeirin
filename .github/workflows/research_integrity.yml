@@ -12,4 +12,4 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements.txt
       - run: python tests/test_logger.py
-      - run: python -m unittest discover -s tests -p test_research_assets.py -v
+      - run: python -m unittest discover -s tests -p 'test_research_*.py' -v

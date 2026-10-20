@@ -289,17 +289,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="data")
     ap.add_argument("--window-min", type=float, default=12.0)
-    ap.add_argument("--research-bundle",help="Optional frozen research inference bundle; collection also works without it")
+    ap.add_argument("--research-bundle",action='append',default=[],help="Optional frozen bundle; repeat for independently frozen cohorts")
+    ap.add_argument("--research-manifest",help="Prepared mapping of cohort names to frozen bundle paths")
     a = ap.parse_args(argv)
     forecaster=None
-    if a.research_bundle:
-        sys.path.insert(0,os.path.join(os.path.abspath(a.research_bundle),'source'))
-        from keirin_lab.live_worker import LiveWorker
-        try:
-            forecaster=LiveWorker(a.research_bundle,a.out_dir)
-            print(f"research bundle loaded: {len(forecaster.models)} independent models; frozen_at={forecaster.frozen_at}; research only")
-        except Exception as error:
-            print(f"research bundle unavailable; capture continues: {type(error).__name__}: {str(error)[:200]}")
+    bundles=list(a.research_bundle)
+    if a.research_manifest:
+        with open(a.research_manifest,encoding='utf-8') as f:bundles.extend(json.load(f).values())
+    if bundles:
+        from research_runtime import ResearchGroup
+        forecaster=ResearchGroup(list(dict.fromkeys(bundles)),a.out_dir)
     try:
         Logger(NetkeirinClient(), a.out_dir, a.window_min,forecaster=forecaster).run()
     finally:

@@ -34,6 +34,23 @@ def install_bundle(repo,reference,directory):
     return root
 
 
+def install_bundles(repo,reference,directory):
+    config=json.loads(Path(reference).read_text(encoding='utf-8'));target=Path(directory)
+    entries=config.get('bundles',{'v1':config});installed={};failures={}
+    if not entries:raise ValueError('No registered bundles')
+    for name,item in entries.items():
+        if not name.replace('-','').isalnum():raise ValueError('Invalid cohort name')
+        destination=target/name;destination.mkdir(parents=True,exist_ok=True)
+        ref=destination/'reference.json';ref.write_text(json.dumps(item),encoding='utf-8')
+        try:installed[name]=str(install_bundle(repo,ref,destination))
+        except Exception as error:failures[name]=type(error).__name__+': '+str(error)[:200]
+    (target/'active_bundles.json').write_text(json.dumps(installed,indent=2),encoding='utf-8')
+    (target/'preparation.json').write_text(json.dumps({'installed':installed,'failures':failures},indent=2),encoding='utf-8')
+    print(json.dumps({'installed':installed,'failures':failures}))
+    if not installed:raise RuntimeError('No research bundle available')
+    return installed
+
+
 def state_download(repo,directory,day):
     out=Path(directory);tag='forward-'+day[:4]+'-'+day[4:6]
     for pattern in (f'forward_{day}.sqlite.gz',f'forward_events_{day}.jsonl.gz',f'forward_inputs_{day}.jsonl.gz'):
@@ -72,12 +89,12 @@ def main():
     p.add_argument('--history',action='store_true',help='Only the daily settlement job may publish history updates')
     a=p.parse_args();day=a.day or datetime.now().strftime('%Y%m%d')
     if a.command=='upload':upload_state(a.repo,a.data_dir,a.history);return
-    bundle=install_bundle(a.repo,a.reference,'research-runtime');state_download(a.repo,a.data_dir,day)
+    bundles=install_bundles(a.repo,a.reference,'research-runtime');state_download(a.repo,a.data_dir,day)
+    shutil.copy2('research-runtime/preparation.json',Path(a.data_dir)/f'forward_preparation_{day}.json')
     if a.command=='settle':
         tag='odds-'+day[:4]+'-'+day[4:6];download(a.repo,tag,f'odds_{day}.jsonl.gz',a.data_dir)
-        sys.path.insert(0,str(bundle/'source'))
-        from keirin_lab.settlement import settle_day
-        print(json.dumps(settle_day(bundle,a.data_dir,a.extra,day)))
+        from research_runtime import settle_bundles
+        print(json.dumps(settle_bundles(bundles,a.data_dir,a.extra,day)))
 
 
 if __name__=='__main__':main()
