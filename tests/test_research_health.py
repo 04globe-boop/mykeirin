@@ -172,4 +172,13 @@ class CoverageContract(unittest.TestCase):
                 self.assertEqual(report['cohorts'][cohort]['excluded_before_freeze'],1)
                 self.assertEqual(report['cohorts'][cohort]['missing_races'],0)
 
+    def test_midnight_wait_for_scheduled_results_is_not_a_label_outage(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+            early=datetime(2026,10,22,15,10,tzinfo=timezone.utc)
+            report=research_health.audit_day(data,DAY,bundles,now=early)
+            self.assertEqual(report['results']['unmatched_races'],1)
+            self.assertNotIn('result_labels_missing',[v['code'] for v in report['issues']])
+            self.assertFalse(report['results']['due'])
+
 if __name__=='__main__':unittest.main()

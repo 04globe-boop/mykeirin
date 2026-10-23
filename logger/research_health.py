@@ -179,8 +179,10 @@ def audit_day(data_dir,day,bundles,*,now=None,extra_path=None,failures=()):
     if error_counts.get('k') and not successes.get('k'):issue('result_source_all_error','result_source',source='k',races=error_counts['k'])
     if error_counts.get('racelist'):issue('result_source_schedule_failed','result_source',errors=error_counts['racelist'])
     unlabelled=actual-set(labels);unmatched=unlabelled-set(observed_exclusions)
-    # The daily collector is the result producer; pending same-day results are normal.
-    label_due=now.astimezone(JST).date()>datetime.strptime(day,'%Y%m%d').date()
+    # K runs at 06:17 and NK at 06:47 JST (60-minute job budget), then a
+    # reconciliation job runs. Midnight is still a normal wait for results.
+    expected_by=(datetime.strptime(day,'%Y%m%d')+timedelta(days=1,hours=8)).replace(tzinfo=JST)
+    label_due=now>=expected_by
     if unmatched and label_due:issue('result_labels_missing','results',races=len(unmatched))
     summaries=sorted(out.glob(f'logger_summary_{day}*.json'))
     run=None
@@ -208,7 +210,7 @@ def audit_day(data_dir,day,bundles,*,now=None,extra_path=None,failures=()):
         'schedule':{'known':known,'scheduled':len(schedule) if known else None,'scheduled_latest':latest_count,'completed_cutoffs':len(completed),'eligible':len(eligible),'excluded':len(excluded),'excluded_reasons':excluded,'eligibility_unverified':len(unverified),'pending_cutoffs':len(schedule)-len(completed)},
         'capture':{'record_types':dict(Counter(v.get('type','unknown') for v in records)),'run_summary':run},
         'cohorts':cohorts,
-        'results':{'prediction_races':len(actual),'labelled_races':len(actual&set(labels)),'unlabelled_races':len(unlabelled),'excluded_result_races':len(observed_exclusions),'excluded_reasons':observed_exclusions,'unmatched_races':len(unmatched),'unmatched_race_ids':sorted(unmatched),'source_errors':dict(error_counts),'source_successes':dict(successes),'source_errors_time_unknown':dict(untimed_errors)},
+        'results':{'prediction_races':len(actual),'labelled_races':len(actual&set(labels)),'unlabelled_races':len(unlabelled),'excluded_result_races':len(observed_exclusions),'excluded_reasons':observed_exclusions,'unmatched_races':len(unmatched),'unmatched_race_ids':sorted(unmatched),'source_errors':dict(error_counts),'source_successes':dict(successes),'source_errors_time_unknown':dict(untimed_errors),'due':label_due,'expected_by':expected_by.isoformat()},
         'events':{'record_types':dict(Counter(v.get('type','unknown') for v in events)),'legacy_miss_races':len(misses),'contradicted_miss_races':len(contradicted),'prediction_event_missing_races':len(event_missing)},
         'issues':issues,'performance_reported':False,'evaluation_denominator_changed':False}
 

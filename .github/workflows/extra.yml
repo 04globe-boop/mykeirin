@@ -3,6 +3,9 @@ name: extra
 # Kドリームス・オッズパークのページ（走り評・記者評価・選手コメント・レース後談話）の収集。
 # 月ごと（stride で連鎖、2022-01 まで）と、毎朝の前日分（schedule）の2通り。
 on:
+  workflow_run:
+    workflows: [nk-results]
+    types: [completed]
   schedule:
     - cron: "17 21 * * *"   # 毎日 06:17 JST に前日分
   workflow_dispatch:
@@ -39,7 +42,26 @@ env:
   FIRST_MONTH: "2022-01"
 
 jobs:
+  reconcile_after_nk:
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reconcile after the scheduled fallback producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DAY=$(python logger/research_reconcile.py --event "$GITHUB_EVENT_PATH" --repo "$GITHUB_REPOSITORY")
+          if [ -n "$DAY" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/extra.yml/dispatches" -f ref=main -f "inputs[day]=$DAY"
+          fi
+
   collect:
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     outputs:
