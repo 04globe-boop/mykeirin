@@ -97,8 +97,27 @@ def result_of(extra: list[dict], rid: str):
     return {"status": "確定", "wins": tri}
 
 
-def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_json: str | None, now: datetime):
+def nk_result_of(nk: list[dict], rid: str):
+    """netkeirin の結果ページ（tools/collect_nk_results.py）から。Kドリームスが取れないときの代わり。"""
+    xs = [r for r in nk if r.get("type") == "nk_result" and str(r.get("race_id")) == rid
+          and (r.get("data") or {}).get("status") in ("確定", "返還")]
+    if not xs:
+        return None
+    data = xs[-1]["data"]
+    if data["status"] == "返還":
+        return {"status": "返還・不成立"}
+    tri = {}
+    for combo, yen, _pop in data["payout"].get("３連単", []):
+        parts = [str(int(x)) for x in re.split(r"[>\-]", combo) if x.strip()]
+        if len(parts) == 3:
+            tri[tuple(parts)] = int(yen)
+    return {"status": "確定", "wins": tri} if tri else {"status": "払戻なし"}
+
+
+def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_json: str | None, now: datetime,
+          nk_path: str | None = None):
     mult = load_mult(mult_path)
+    nk = read_gz(nk_path) if nk_path else []
     recs = read_gz(odds_path)
     extra = read_gz(extra_path)
     override = json.load(open(results_json)) if results_json else {}
@@ -139,6 +158,10 @@ def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_js
             res = result_of(extra, rid)
             if res:
                 res["source"] = "kdreams"
+            else:
+                res = nk_result_of(nk, rid)
+                if res:
+                    res["source"] = "netkeirin"
         if not res:
             row["status"] = "結果待ち"
         elif res["status"] != "確定":

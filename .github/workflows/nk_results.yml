@@ -1,0 +1,69 @@
+name: nk-results
+
+# netkeirin の結果ページ（着順・払戻）の収集。Kドリームスが取れないときの代わりの出典（Claude側・独立）。
+# 既存の収集ワークフローとは別のファイル（nk_results_YYYYMM.jsonl.gz）・別のリリース（nk-results）に保存する。
+on:
+  schedule:
+    - cron: "47 21 * * *"   # 毎日 06:47 JST に前日分
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "収集する日（YYYY-MM-DD をスペース区切り）。空なら前日"
+        required: false
+        default: ""
+
+concurrency:
+  group: nk-results
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Tokyo
+  DATA_REPO: ${{ github.repository_owner }}/mykeirin2
+  TAG: nk-results
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+      DATES: ${{ github.event.inputs.dates }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Decide target
+        id: t
+        run: |
+          [ -z "$DATES" ] && DATES=$(date -d yesterday +%F)
+          ARGS=""; MONTHS=""
+          for D in $DATES; do ARGS="$ARGS --date $D"; MONTHS="$MONTHS $(echo $D | cut -c1-7 | tr -d '-')"; done
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "months=$(echo $MONTHS | tr ' ' '\n' | sort -u | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Download existing files (resume)
+        run: |
+          mkdir -p nk
+          for M in ${{ steps.t.outputs.months }}; do
+            gh release download "$TAG" --repo "$DATA_REPO" -p "nk_results_${M}.jsonl.gz" -D nk --clobber 2>/dev/null || echo "no existing file for $M"
+          done
+
+      - name: Collect
+        run: python tools/collect_nk_results.py ${{ steps.t.outputs.args }} --out-dir nk
+
+      - name: Upload
+        if: always()
+        run: |
+          gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "nk-results" --notes "netkeirin の結果ページ（着順・払戻）。Kドリームスの代わりの出典（Claude側）"
+          for F in nk/nk_results_*.jsonl.gz; do
+            [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
+          done

@@ -74,7 +74,9 @@ def main(argv=None):
                 d += timedelta(days=1)
                 continue
             asset("extra", f"extra_{ds[:6]}.jsonl.gz", extra)
-            rows = paper_trade.build(ds, odds, extra, a.mult, None, now)
+            nk = os.path.join(a.work, f"nk_results_{ds[:6]}.jsonl.gz")
+            asset("nk-results", f"nk_results_{ds[:6]}.jsonl.gz", nk)  # Kドリームスが取れないときの代わり（なければ使わない）
+            rows = paper_trade.build(ds, odds, extra, a.mult, None, now, nk if os.path.exists(nk) else None)
             json.dump(rows, open(out, "w", encoding="utf-8"), ensure_ascii=False)
             from collections import Counter
             report.append(f"{ds}: " + ", ".join(f"{k} {v}" for k, v in Counter(r["status"] for r in rows).items()))
