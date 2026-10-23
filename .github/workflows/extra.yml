@@ -19,6 +19,10 @@ on:
         description: "同じ月の再開回数（自動で増える）"
         required: false
         default: "1"
+      day:
+        description: "日次の対象日 YYYY-MM-DD（空なら前日、過去の結果再取得にも使用）"
+        required: false
+        default: ""
 
 concurrency:
   group: extra-${{ github.event.inputs.month || 'daily' }}
@@ -38,6 +42,9 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    outputs:
+      day: ${{ steps.t.outputs.day }}
+      ym: ${{ steps.t.outputs.ym }}
     env:
       GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
       MONTH: ${{ github.event.inputs.month }}
@@ -53,11 +60,16 @@ jobs:
 
       - name: Decide target
         id: t
+        env:
+          DAY_INPUT: ${{ github.event.inputs.day }}
         run: |
           if [ -n "$MONTH" ]; then
             echo "args=--month $MONTH" >> "$GITHUB_OUTPUT"; echo "ym=$(echo $MONTH | tr -d '-')" >> "$GITHUB_OUTPUT"
           else
-            D=$(date -d 'yesterday' +%F); echo "args=--date $D" >> "$GITHUB_OUTPUT"; echo "ym=$(date -d 'yesterday' +%Y%m)" >> "$GITHUB_OUTPUT"
+            D=$(python -c "from datetime import date,timedelta; import os; print(date.fromisoformat(os.environ['DAY_INPUT']) if os.environ.get('DAY_INPUT') else date.today()-timedelta(days=1))")
+            echo "args=--date $D" >> "$GITHUB_OUTPUT"
+            echo "ym=${D:0:4}${D:5:2}" >> "$GITHUB_OUTPUT"
+            echo "day=${D//-/}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download existing file (resume)
@@ -75,14 +87,6 @@ jobs:
           for F in extra/extra_*.jsonl.gz; do
             [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
           done
-
-      - name: Settle yesterday's frozen forecasts
-        if: success() && github.event.inputs.month == ''
-        continue-on-error: true
-        run: |
-          D=$(date -d yesterday +%Y%m%d)
-          python logger/research_assets.py settle --repo "$DATA_REPO" --day "$D" --extra "extra/extra_${{ steps.t.outputs.ym }}.jsonl.gz"
-          python logger/research_assets.py upload --repo "$DATA_REPO" --history
 
       - name: Chain next run
         if: success() && github.event.inputs.month != ''
@@ -109,3 +113,56 @@ jobs:
                 -f ref=main -f "inputs[month]=$NEXT" -f "inputs[stride]=$STRIDE" -f "inputs[attempt]=1"
             fi
           fi
+
+  settle:
+    needs: collect
+    if: ${{ always() && needs.collect.outputs.day != '' && github.event.inputs.month == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: research-state-writer
+      queue: max
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+      TARGET_DAY: ${{ needs.collect.outputs.day }}
+      TARGET_YM: ${{ needs.collect.outputs.ym }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Download observed result sources
+        run: |
+          mkdir -p extra nk
+          gh release download extra --repo "$DATA_REPO" -p "extra_${TARGET_YM}.jsonl.gz" -D extra --clobber || echo "K source file unavailable; audit will retain the failure"
+          gh release download nk-results --repo "$DATA_REPO" -p "nk_results_${TARGET_YM}.jsonl.gz" -D nk --clobber || echo "NK fallback unavailable; audit will retain missing results"
+      - name: Settle verified observed results
+        id: settle
+        run: python logger/research_assets.py settle --repo "$DATA_REPO" --day "$TARGET_DAY" --extra "extra/extra_${TARGET_YM}.jsonl.gz" --nk "nk/nk_results_${TARGET_YM}.jsonl.gz"
+      - name: Preserve and publish state
+        id: publish
+        if: always()
+        run: python logger/research_assets.py upload --repo "$DATA_REPO" --history
+      - name: Audit daily coverage
+        if: always()
+        env:
+          SETTLE_OUTCOME: ${{ steps.settle.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          ARGS=()
+          [ "$SETTLE_OUTCOME" = success ] || ARGS+=(--failure results:settlement_job_failed)
+          [ "$PUBLISH_OUTCOME" = success ] || ARGS+=(--failure transport:canonical_publication_failed)
+          python logger/research_health.py --data-dir data --day "$TARGET_DAY" --extra "extra/extra_${TARGET_YM}.jsonl.gz" "${ARGS[@]}"
+      - name: Publish private health and request incident processing
+        if: always()
+        run: python logger/research_health_publish.py publish --repo "$DATA_REPO" --report "data/forward_health_${TARGET_DAY}.json" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: Mark operational failures after preservation
+        if: always()
+        run: |
+          python - <<'PY'
+          import json,os
+          report=json.load(open('data/forward_health_'+os.environ['TARGET_DAY']+'.json'))
+          if report['status']!='healthy': raise SystemExit('Operational incidents recorded in private health report')
+          PY

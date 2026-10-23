@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -349,7 +350,17 @@ def main(argv=None) -> int:
     from precutoff_capture import TimedOddsCapture
     pre_capture=TimedOddsCapture()
     try:
-        Logger(NetkeirinClient(), a.out_dir, a.window_min,forecaster=forecaster,pre_capture=pre_capture).run()
+        summary=Logger(NetkeirinClient(), a.out_dir, a.window_min,forecaster=forecaster,pre_capture=pre_capture).run()
+        # A normal process exit does not imply a healthy capture. Preserve the
+        # run counts for the independent post-save health gate.
+        day=datetime.fromisoformat(summary['start']).astimezone(JST).strftime('%Y%m%d')
+        run_id=os.environ.get('GITHUB_RUN_ID',uuid.uuid4().hex)
+        if not str(run_id).replace('-','').isalnum():raise ValueError('Invalid run identifier')
+        receipt={'schema_version':'capture-summary-v1','run_id':run_id,
+                 'run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT','1'),**summary}
+        os.makedirs(a.out_dir,exist_ok=True)
+        with open(os.path.join(a.out_dir,f'logger_summary_{day}_{run_id}.json'),'w',encoding='utf-8') as stream:
+            json.dump(receipt,stream,ensure_ascii=False,allow_nan=False)
     finally:
         pre_capture.close()
         if forecaster is not None:forecaster.close()

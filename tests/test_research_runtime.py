@@ -1,5 +1,6 @@
 import json,os,sys,tempfile,unittest,sqlite3
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'logger'))
@@ -49,6 +50,17 @@ def settle_day(bundle,out,extra,day):return {'cohort':VALUE,'settled':1}
             self.assertEqual(result['cohorts']['v1']['cohort'],'old')
             self.assertEqual(json.loads((out/'forward_report_v2_20261020.json').read_text())['cohort'],'new')
 
+    def test_real_manifest_uses_versioned_observed_adapter_and_holdout_guard(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            root=Path(tmp);bundle=self.fixture(root,'v1','legacy');out=root/'out';out.mkdir()
+            (bundle/'bundle.json').write_text(json.dumps({'candidate_ids':{}}))
+            raw={'summaries':{'gnn':{'settled_races':2,'nll':4.2,'primary_nll':4.1}}}
+            with patch('research_results.settle_observed_day',return_value=raw) as adapter, patch.object(research_runtime,'normalize_summary_days'):
+                result=research_runtime.settle_bundles({'v1':bundle},out,'extra.gz','20261121',nk_path='nk.gz')
+            self.assertEqual(adapter.call_args.args,(bundle,out,'extra.gz','nk.gz','20261121'))
+            self.assertIs(adapter.call_args.kwargs['module_loader'],research_runtime.bundle_module)
+            self.assertIsNone(result['cohorts']['v1']['summaries']['gnn']['nll'])
+
     def test_one_unavailable_archive_preserves_available_cohort(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
             root=Path(tmp);ref=root/'references.json';ref.write_text(json.dumps({'bundles':{'v1':{},'v2':{}}}))
@@ -83,6 +95,69 @@ def settle_day(bundle,out,extra,day):return {'cohort':VALUE,'settled':1}
             self.assertEqual(report['summaries']['gnn']['days'],1)
             self.assertEqual(report['summaries']['gnn']['primary_days'],1)
             self.assertEqual(report['summaries']['gnn']['nll'],4.1)
+
+
+class RestartIssuance(unittest.TestCase):
+    def worker(self, root, name, candidate_ids):
+        bundle = root / name / 'bundle'
+        source = bundle / 'source/keirin_lab'
+        source.mkdir(parents=True)
+        (source / '__init__.py').write_text('')
+        (bundle / 'bundle.json').write_text(json.dumps({'candidate_ids': candidate_ids}))
+        # Mirrors the frozen branch that emits an expired-cutoff miss before opening a ledger.
+        (source / 'live_worker.py').write_text('''import json
+from pathlib import Path
+class LiveWorker:
+    def __init__(self,bundle,out_dir,log=print):
+        self.root=Path(bundle);self.out=Path(out_dir);self.handled=set();self.models={};self.frozen_at='fixed'
+        self.manifest=json.loads((self.root/'bundle.json').read_text())
+    def tick(self,races,now,end):
+        for race in races:
+            if race.race_id in self.handled:continue
+            if now>race.close:
+                self.handled.add(race.race_id)
+                with (self.out/('forward_events_'+race.kaisai_date+'.jsonl')).open('a') as stream:
+                    stream.write(json.dumps({'type':'miss','race_id':race.race_id})+'\\n')
+        return []
+    def close(self):pass
+''')
+        return bundle
+
+    def test_expired_restart_uses_only_its_own_cohort_and_suppresses_partial_false_miss(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            root = Path(tmp); out = root/'data'; out.mkdir()
+            a = self.worker(root, 'v1', {'a':'v1-a', 'b':'v1-b'})
+            b = self.worker(root, 'v2', {'a':'v2-a', 'b':'v2-b'})
+            db = sqlite3.connect(out/'forward_20261022.sqlite')
+            db.execute('CREATE TABLE predictions(race_id TEXT,model_id TEXT,PRIMARY KEY(race_id,model_id))')
+            # r-complete is v1 complete, r-partial is v1 partial, v2 has neither.
+            db.executemany('INSERT INTO predictions VALUES(?,?)', [('r-complete','v1-a'),('r-complete','v1-b'),('r-partial','v1-a')])
+            db.commit(); db.close()
+            before = datetime(2026,10,22,12,tzinfo=timezone.utc)
+            races = [SimpleNamespace(race_id=rid,kaisai_date='20261022',close=before) for rid in ('r-complete','r-partial','r-empty')]
+            group = research_runtime.ResearchGroup([a,b],out,log=lambda value:None)
+            self.addCleanup(group.close)
+            group.tick(races,before+timedelta(hours=1),before+timedelta(hours=2))
+            events = [json.loads(line) for line in (out/'forward_events_20261022.jsonl').read_text().splitlines()]
+            # Complete + partial v1 must never become new total misses; v2 remains independent.
+            self.assertEqual([e['race_id'] for e in events if e['type']=='miss'], ['r-empty','r-complete','r-partial','r-empty'])
+            self.assertIn('r-partial',group.workers[0].handled)
+            self.assertIn('r-partial',group.workers[0]._prior_issuance['20261022'])
+            self.assertEqual(group.workers[0]._prior_issuance['20261022']['r-partial'], {'v1-a'})
+
+    def test_before_cutoff_partial_issuance_is_not_marked_globally_handled(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            root = Path(tmp); out=root/'data'; out.mkdir()
+            bundle = self.worker(root,'v1',{'a':'v1-a','b':'v1-b'})
+            db=sqlite3.connect(out/'forward_20261022.sqlite')
+            db.execute('CREATE TABLE predictions(race_id TEXT,model_id TEXT)')
+            db.execute('INSERT INTO predictions VALUES(?,?)',('r','v1-a')); db.commit(); db.close()
+            now=datetime(2026,10,22,12,tzinfo=timezone.utc)
+            race=SimpleNamespace(race_id='r',kaisai_date='20261022',close=now+timedelta(minutes=10))
+            group=research_runtime.ResearchGroup([bundle],out,log=lambda value:None)
+            self.addCleanup(group.close)
+            group.tick([race],now,now+timedelta(minutes=20))
+            self.assertNotIn('r',group.workers[0].handled)
 
 
 if __name__=='__main__':unittest.main()

@@ -161,6 +161,8 @@ def main(argv=None) -> int:
     n_new = n_err = 0
 
     def write(rec):
+        if rec.get('type')=='error' and not rec.get('fetched_at'):
+            rec=dict(rec,fetched_at=datetime.now(JST).isoformat(timespec='microseconds'))
         with gzip.open(path, "at", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
 
