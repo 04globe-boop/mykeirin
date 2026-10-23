@@ -27,7 +27,7 @@ env:
 jobs:
   log:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -38,24 +38,15 @@ jobs:
       - name: Install
         run: pip install -r requirements.txt
 
-      - name: Download today's file from data repo
-        env:
-          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
-        run: |
-          mkdir -p data
-          for D in $(date +%Y%m%d) $( [ "$(date +%-H)" -lt 3 ] && date -d yesterday +%Y%m%d ); do
-            TAG="odds-${D:0:4}-${D:4:2}"
-            gh release download "$TAG" --repo "$DATA_REPO" -p "odds_${D}.jsonl.gz" -D data --clobber 2>/dev/null || echo "no existing file for $D"
-          done
-
       - name: Prepare frozen research inference
         id: research
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
-        run: python logger/research_assets.py prepare --repo "$DATA_REPO"
+        run: python logger/research_assets.py prepare --repo "$DATA_REPO" --window-min "${{ github.event.inputs.window_min || '12' }}"
 
       - name: Run logger
+        id: capture
         env:
           RESEARCH_READY: ${{ steps.research.outcome }}
         run: |
@@ -63,26 +54,49 @@ jobs:
           if [ "$RESEARCH_READY" = "success" ]; then ARGS+=(--research-manifest research-runtime/active_bundles.json); fi
           python logger/run_logger.py --out-dir data --window-min "${{ github.event.inputs.window_min || '12' }}" "${ARGS[@]}"
 
-      - name: Upload prospective research records
+      - name: Pack captured evidence without publishing
         if: always()
+        run: |
+          mkdir -p data
+          if [ -f research-runtime/preparation.json ]; then cp research-runtime/preparation.json "data/forward_preparation_$(date +%Y%m%d).json"; fi
+          python logger/research_assets.py pack --data-dir data --stage capture
+
+      - name: Preserve capture in the private data repository
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: python logger/research_handoff.py stage --repo "$DATA_REPO"
+
+  publish:
+    needs: log
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only short writers share this lock; extra's long collection does not.
+    concurrency:
+      group: research-state-writer
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Restore verified private capture
+        id: handoff
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: python logger/research_handoff.py receive --repo "$DATA_REPO"
+
+      - name: Upload prospective research records safely
+        id: publish
         env:
           GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: python logger/research_assets.py upload --repo "$DATA_REPO"
 
-      - name: Upload to data repo
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
-        run: |
-          for F in data/odds_*.jsonl.gz; do
-            [ -e "$F" ] || continue
-            D=$(basename "$F" | sed -E 's/odds_([0-9]{8}).*/\1/')
-            TAG="odds-${D:0:4}-${D:4:2}"
-            gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "odds ${D:0:4}-${D:4:2}" --notes "締切前オッズの記録（開催日ごとのファイル）"
-            gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
-          done
-
       - name: Daily heartbeat commit
+        if: always()
         run: |
           TODAY=$(date +%Y-%m-%d)
           mkdir -p status
@@ -108,3 +122,39 @@ jobs:
           else
             echo "outside operating hours; not chaining"
           fi
+
+      - name: Audit saved coverage
+        if: always()
+        env:
+          HANDOFF_OUTCOME: ${{ steps.handoff.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          CAPTURE_RESULT: ${{ needs.log.result }}
+        run: |
+          ARGS=()
+          [ "$HANDOFF_OUTCOME" = success ] || ARGS+=(--failure transport:private_handoff_failed)
+          [ "$PUBLISH_OUTCOME" = success ] || ARGS+=(--failure transport:canonical_publication_failed)
+          [ "$CAPTURE_RESULT" = success ] || ARGS+=(--failure capture:capture_job_failed)
+          DAYS=$(python -c "import sys;sys.path.insert(0,'logger');from research_state import days_for_window;from datetime import datetime;from zoneinfo import ZoneInfo;print(' '.join(days_for_window(datetime.now(ZoneInfo('Asia/Tokyo')),0)))")
+          for D in $DAYS; do
+            python logger/research_health.py --data-dir data --day "$D" "${ARGS[@]}"
+          done
+
+      - name: Publish private health and request incident processing
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          for F in data/forward_health_*.json; do
+            [ -e "$F" ] || continue
+            python logger/research_health_publish.py publish --repo "$DATA_REPO" --report "$F" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          done
+
+      - name: Mark operational failures after preservation
+        if: always()
+        run: |
+          python - <<'PY'
+          import glob,json
+          reports=[json.load(open(p)) for p in glob.glob('data/forward_health_*.json')]
+          if not reports: raise SystemExit('No operational audit report')
+          if any(r['status']!='healthy' for r in reports): raise SystemExit('Operational incidents recorded in private health reports')
+          PY

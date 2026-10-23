@@ -25,6 +25,7 @@ class ResearchGroup:
                     from research_inference import TimedInference,ModelProxy
                     worker._bounded_inference=TimedInference(bundle)
                     worker.models={name:ModelProxy(name,model,worker._bounded_inference) for name,model in worker.models.items()}
+                    worker._prior_issuance={}
                 self.workers.append(worker)
                 log(f'research bundle loaded: {Path(bundle).parent.name}; {len(worker.models)} independent models; frozen_at={worker.frozen_at}; research only')
             except Exception as error:
@@ -41,10 +42,30 @@ class ResearchGroup:
     def tick(self,races,now,end):
         upcoming=[];races=list(races)
         for worker in list(self.workers):
-            try:upcoming.extend(worker.tick(races,now,end))
+            try:
+                self.restore_issuance(worker,races,now)
+                upcoming.extend(worker.tick(races,now,end))
             except Exception as error:
                 self.failure(worker.root,error);self.close_worker(worker);self.workers.remove(worker)
         return upcoming
+
+    def restore_issuance(self,worker,races,now):
+        from datetime import timedelta
+        from research_state import issuance_by_race
+        # Older synthetic workers have no manifest/handled ledger contract.
+        if not hasattr(worker,'manifest') or not hasattr(worker,'handled'):return
+        candidate_ids=set(worker.manifest.get('candidate_ids',{}).values())
+        if not candidate_ids:return
+        for day in {race.kaisai_date for race in races}:
+            if day not in worker._prior_issuance:
+                worker._prior_issuance[day]=issuance_by_race(self.out/f'forward_{day}.sqlite',candidate_ids)
+        for race in races:
+            issued=worker._prior_issuance[race.kaisai_date].get(race.race_id,set())
+            # Complete issuance can be skipped at any time. Past the fixed cutoff,
+            # partial issuance must remain partial in audits, never become a total
+            # miss or a new attempt to fill historical missing candidates.
+            if issued and (candidate_ids.issubset(issued) or now>race.close-timedelta(minutes=5)):
+                worker.handled.add(race.race_id)
 
     def close(self):
         for worker in self.workers:self.close_worker(worker)
@@ -91,11 +112,16 @@ def normalize_summary_days(report,ledger_path,manifest):
     return report
 
 
-def settle_bundles(bundles,out_dir,extra,day):
+def settle_bundles(bundles,out_dir,extra,day,*,nk_path=None):
     reports={};out=Path(out_dir)
     for name,bundle in bundles.items():
         try:
-            report=bundle_module(bundle,'settlement').settle_day(bundle,out,extra,day)
+            if (Path(bundle)/'bundle.json').exists():
+                from research_results import settle_observed_day
+                report=settle_observed_day(bundle,out,extra,nk_path,day,module_loader=bundle_module)
+            else:
+                # Compatibility for the manifestless synthetic import fixtures.
+                report=bundle_module(bundle,'settlement').settle_day(bundle,out,extra,day)
             if report.get('summaries'):
                 manifest=json.loads((Path(bundle)/'bundle.json').read_text(encoding='utf-8'))
                 normalize_summary_days(report,out/f'forward_{day}.sqlite',manifest)
