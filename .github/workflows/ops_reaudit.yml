@@ -1,0 +1,28 @@
+name: ops-reaudit-20261029
+on:
+  push:
+    branches: [codex/ops-reaudit-20261029]
+    paths:
+      - .github/workflows/ops_reaudit.yml
+      - tools/verify_operational_reaudit.py
+permissions:
+  contents: read
+jobs:
+  reaudit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: research-state-writer
+      queue: max
+      cancel-in-progress: false
+    env:
+      TZ: Asia/Tokyo
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Audit copies and publish only private operational health
+        run: python tools/verify_operational_reaudit.py
