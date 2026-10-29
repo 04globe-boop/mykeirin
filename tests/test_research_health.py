@@ -140,6 +140,7 @@ class CoverageContract(unittest.TestCase):
                       {'type':'k','race_id':rid,'fetched_at':'2026-10-23T06:20:00+09:00','data':{}}])
             report=research_health.audit_day(data,DAY,bundles,now=NOW,extra_path=extra)
             self.assertEqual(report['results']['source_successes']['k'],1)
+            self.assertEqual(report['results'].get('source_success_latest_at'),{'k':'2026-10-23T06:20:00+09:00'})
             self.assertNotIn('result_source_all_error',[v['code'] for v in report['issues']])
 
     def test_legacy_k_page_mismatch_without_timestamp_is_still_a_visible_failure(self):
@@ -180,5 +181,62 @@ class CoverageContract(unittest.TestCase):
             self.assertEqual(report['results']['unmatched_races'],1)
             self.assertNotIn('result_labels_missing',[v['code'] for v in report['issues']])
             self.assertFalse(report['results']['due'])
+
+    def missing_source_receipt(self, rid):
+        return dict(schema_version='result-observation-v1',race_id=rid,status='unavailable',
+                    reason='no_result_observation',available_at=None,source_id=None,
+                    source_type=None,source_sha256=None,recorded_at='2026-10-23T06:30:00+09:00')
+
+    def test_missing_source_receipt_is_not_corrupt_evidence_after_results_are_due(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+            (data/f'forward_observations_{DAY}.jsonl').write_text(json.dumps(self.missing_source_receipt(rid))+'\n',encoding='utf-8')
+            report=research_health.audit_day(data,DAY,bundles,now=NOW)
+            self.assertNotIn('observation_evidence_invalid',[v['code'] for v in report['issues']])
+            self.assertEqual(report['results']['unmatched_races'],1)
+            self.assertIn('result_labels_missing',[v['code'] for v in report['issues']])
+
+    def test_missing_source_receipt_preserves_the_normal_predeadline_wait(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+            (data/f'forward_observations_{DAY}.jsonl').write_text(json.dumps(self.missing_source_receipt(rid))+'\n',encoding='utf-8')
+            before_due=datetime(2026,10,22,22,tzinfo=timezone.utc)
+            report=research_health.audit_day(data,DAY,bundles,now=before_due)
+            self.assertNotIn('observation_evidence_invalid',[v['code'] for v in report['issues']])
+            self.assertEqual(report['results']['unmatched_races'],1)
+            self.assertNotIn('result_labels_missing',[v['code'] for v in report['issues']])
+
+    def test_supplied_result_source_without_time_is_still_invalid_evidence(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+            for field,content in [('source_type','nk_result'),('source_id','https://example.test/result'),('source_sha256','a'*64)]:
+                with self.subTest(field=field):
+                    value=self.missing_source_receipt(rid);value[field]=content
+                    (data/f'forward_observations_{DAY}.jsonl').write_text(json.dumps(value)+'\n',encoding='utf-8')
+                    report=research_health.audit_day(data,DAY,bundles,now=NOW)
+                    self.assertIn('observation_evidence_invalid',[v['code'] for v in report['issues']])
+                    self.assertEqual(report['results']['unmatched_races'],1)
+
+    def test_missing_source_attempt_cannot_refute_confirmed_tie_or_refund(self):
+        for status in ('excluded_tie','refund'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+                data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+                confirmed=dict(schema_version='result-observation-v1',race_id=rid,status=status,
+                               source_type='nk_result',source_id='https://example.test/result',source_sha256='a'*64,
+                               available_at='2026-10-23T06:00:00+09:00',recorded_at='2026-10-23T06:30:00+09:00')
+                missing=self.missing_source_receipt(rid);missing['recorded_at']='2026-10-23T07:00:00+09:00'
+                path=data/f'forward_observations_{DAY}.jsonl'
+                path.write_text(''.join(json.dumps(v)+'\n' for v in (confirmed,missing)),encoding='utf-8')
+                report=research_health.audit_day(data,DAY,bundles,now=NOW)
+                self.assertEqual(report['results']['excluded_result_races'],1)
+                self.assertEqual(report['results']['unmatched_races'],0)
+                self.assertNotIn('result_labels_missing',[v['code'] for v in report['issues']])
+                self.assertNotIn('observation_evidence_invalid',[v['code'] for v in report['issues']])
+                # A later actual source observation is still a real revision.
+                revision=dict(confirmed,status='ready',available_at='2026-10-23T07:15:00+09:00',recorded_at='2026-10-23T07:30:00+09:00')
+                with path.open('a',encoding='utf-8') as stream:stream.write(json.dumps(revision)+'\n')
+                report=research_health.audit_day(data,DAY,bundles,now=NOW)
+                self.assertEqual(report['results']['excluded_result_races'],0)
+                self.assertEqual(report['results']['unmatched_races'],1)
 
 if __name__=='__main__':unittest.main()

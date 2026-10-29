@@ -23,7 +23,7 @@ def report(day='20261022',*,bad=True,at=NOW,component='results',code='result_lab
     return {'schema_version':'operational-health-v1','day':day,'observed_at':at.isoformat(),'status':'degraded' if bad else 'healthy',
         'schedule':{'known':True,'scheduled':86,'eligible':76},
         'capture':{'run_summary':{'end':at.isoformat(),'odds':0 if bad else 10,'error':6 if bad else 0}},
-        'results':{'prediction_races':76,'labelled_races':0 if bad else 74,'excluded_result_races':0 if bad else 2,'unmatched_races':76 if bad else 0,'source_errors':{'k':86} if bad else {},'source_successes':{} if bad else {'k':86}},
+        'results':{'prediction_races':76,'labelled_races':0 if bad else 74,'excluded_result_races':0 if bad else 2,'unmatched_races':76 if bad else 0,'source_errors':{'k':86} if bad else {},'source_successes':{} if bad else {'k':86},'source_success_latest_at':{} if bad else {'k':at.isoformat()}},
         'issues':[{'component':component,'code':code,'severity':'error','detail':'do not expose private content'}] if bad else []}
 
 class IncidentLifecycle(unittest.TestCase):
@@ -87,5 +87,48 @@ class IncidentLifecycle(unittest.TestCase):
         client=FakeIssues();research_incidents.sync_report(report(),client,now=NOW);client.close_issue(1)
         later=NOW+timedelta(minutes=25);research_incidents.sync_report(report(at=later),client,now=later)
         self.assertEqual(client.creates,1)
+
+    def test_reauditing_old_k_success_does_not_close_a_newer_global_outage(self):
+        client=FakeIssues();start=datetime.fromisoformat('2026-10-29T03:00:00+00:00')
+        research_incidents.sync_report(report(day='20261028',at=start,component='result_source',code='result_source_all_error'),client,now=start)
+        later=datetime.fromisoformat('2026-10-29T04:00:00+00:00')
+        value=report(day='20261021',bad=False,at=later)
+        value['status']='degraded';value['issues']=[{'component':'inference','code':'forecast_missing'}]
+        value['results']['source_success_latest_at']={'k':'2026-10-23T04:00:00+00:00'}
+        research_incidents.sync_report(value,client,now=later)
+        self.assertEqual(client.closes,[])
+        self.assertEqual(value['results']['source_successes']['k'],86)
+
+    def test_provider_success_must_cover_the_latest_incident_watermark(self):
+        for provider,component,code in [('k','result_source','result_source_all_error'),('netkeirin','capture','capture_run_all_error')]:
+            with self.subTest(provider=provider):
+                client=FakeIssues();start=datetime.fromisoformat('2026-10-29T02:00:00+00:00')
+                current=datetime.fromisoformat('2026-10-29T03:00:00+00:00')
+                later=datetime.fromisoformat('2026-10-29T04:00:00+00:00')
+                research_incidents.sync_report(report(day='20261028',at=start,component=component,code=code),client,now=start)
+                research_incidents.sync_report(report(day='20261028',at=current,component=component,code=code),client,now=current)
+                value=report(day='20261021',bad=False,at=later)
+                if provider=='k':value['results']['source_success_latest_at']={'k':'2026-10-29T02:30:00+00:00'}
+                else:value['capture']['run_summary']['end']='2026-10-29T02:30:00+00:00'
+                research_incidents.sync_report(value,client,now=later)
+                self.assertEqual(client.closes,[])
+                if provider=='k':value['results']['source_success_latest_at']={'k':'2026-10-29T03:30:00+00:00'}
+                else:value['capture']['run_summary']['end']='2026-10-29T03:30:00+00:00'
+                research_incidents.sync_report(value,client,now=later)
+                self.assertEqual(client.closes,[1])
+
+    def test_missing_naive_malformed_and_future_provider_times_cannot_close(self):
+        for provider,component,code in [('k','result_source','result_source_all_error'),('netkeirin','capture','capture_run_all_error')]:
+            for captured in (None,'bad-time','2026-10-29T03:30:00','2026-10-29T04:01:00+00:00'):
+                with self.subTest(provider=provider,captured=captured):
+                    client=FakeIssues();start=datetime.fromisoformat('2026-10-29T03:00:00+00:00')
+                    later=datetime.fromisoformat('2026-10-29T04:00:00+00:00')
+                    research_incidents.sync_report(report(day='20261028',at=start,component=component,code=code),client,now=start)
+                    value=report(day='20261021',bad=False,at=later)
+                    if provider=='k':value['results']['source_success_latest_at']={} if captured is None else {'k':captured}
+                    elif captured is None:value['capture']['run_summary'].pop('end')
+                    else:value['capture']['run_summary']['end']=captured
+                    research_incidents.sync_report(value,client,now=later)
+                    self.assertEqual(client.closes,[])
 
 if __name__=='__main__':unittest.main()

@@ -318,6 +318,77 @@ class PrivateHealthHandoff(unittest.TestCase):
         self.assertEqual(received['report']['source']['run_id'], '12345')
 
 
+    def test_k_recovery_dispatches_with_unchanged_degraded_issue_codes(self):
+        client = GitHubStore();value = report()
+        value['issues'] = [{'code': 'forecast_missing', 'component': 'inference', 'severity': 'error'}]
+        value['results'].update(source_errors={}, source_successes={})
+        self.publish(client, value)
+        value['results']['source_successes'] = {'k': 67}
+        value['results']['source_success_latest_at'] = {'k': '2026-10-23T10:59:00+00:00'}
+        self.assertTrue(self.publish(client, value, run_id='12346')['dispatched'])
+        value['results']['source_successes']['k'] = 68
+        self.assertFalse(self.publish(client, value, run_id='12347')['dispatched'])
+        self.assertEqual(len(client.dispatches), 2)
+
+    def test_first_healthy_verified_k_recovery_dispatches_once_per_jst_day(self):
+        client = GitHubStore();value = report('healthy')
+        value['results'].update(source_errors={}, source_successes={'k': 67}, source_success_latest_at={'k': '2026-10-23T10:59:00+00:00'})
+        self.assertTrue(self.publish(client, value)['dispatched'])
+        value['results']['source_successes']['k'] = 68
+        self.assertFalse(self.publish(client, value, run_id='12346')['dispatched'])
+        value['observed_at'] = '2026-10-23T15:05:00+00:00'
+        tomorrow = datetime.fromisoformat('2026-10-23T15:10:00+00:00')
+        self.assertTrue(self.publish(client, value, run_id='12347', now=tomorrow)['dispatched'])
+        self.assertEqual(len(client.dispatches), 2)
+
+    def test_verified_netkeirin_proof_dispatches_without_count_noise(self):
+        client = GitHubStore();value = report('healthy')
+        value['capture'] = {'run_summary': {'odds': 1, 'error': 0, 'end': '2026-10-23T10:59:00+00:00'}}
+        self.assertTrue(self.publish(client, value)['dispatched'])
+        value['capture']['run_summary']['odds'] = 200
+        self.assertFalse(self.publish(client, value, run_id='12346')['dispatched'])
+
+    def test_first_healthy_partial_or_unknown_provider_proof_stays_quiet(self):
+        value = report('healthy')
+        value['results'].update(source_errors={'k': 1}, source_successes={'k': 67})
+        value['capture'] = {'run_summary': {'odds': 1, 'error': 1}}
+        self.assertFalse(self.publish(GitHubStore(), value)['dispatched'])
+        value['capture']['run_summary']['error'] = 0
+        value['schedule']['known'] = False
+        self.assertFalse(self.publish(GitHubStore(), value)['dispatched'])
+
+
+    def test_positive_counts_without_a_real_success_time_do_not_emit_positive_proof(self):
+        value=report('healthy');value['results'].update(source_errors={},source_successes={'k':67})
+        self.assertFalse(self.publish(GitHubStore(),value)['dispatched'])
+        value['capture']={'run_summary':{'odds':1,'error':0}}
+        self.assertFalse(self.publish(GitHubStore(),value)['dispatched'])
+
+    def test_old_proof_then_fresh_actual_time_crosses_throttle_with_same_issue_codes(self):
+        client=GitHubStore();value=report(day='20261021',observed='2026-10-29T04:00:00+00:00')
+        value['issues']=[{'code':'forecast_missing','component':'inference','severity':'error'}]
+        value['results'].update(source_errors={},source_successes={'k':67},source_success_latest_at={'k':'2026-10-23T04:00:00+00:00'})
+        now=datetime.fromisoformat('2026-10-29T04:00:00+00:00')
+        self.assertTrue(self.publish(client,value,now=now)['dispatched'])
+        value['results']['source_success_latest_at']['k']='2026-10-29T03:30:00+00:00'
+        self.assertTrue(self.publish(client,value,run_id='12346',now=now)['dispatched'])
+        value['results']['source_successes']['k']=68
+        self.assertFalse(self.publish(client,value,run_id='12347',now=now)['dispatched'])
+        self.assertEqual(len(client.dispatches),2)
+        saved=json.loads(client.assets[client.dispatches[-1]['client_payload']['asset_name']])
+        self.assertEqual(saved['results'].get('source_success_latest_at'),{'k':'2026-10-29T03:30:00+00:00'})
+
+    def test_invalid_and_future_actual_success_times_are_rejected_before_upload(self):
+        for captured in (None,'bad-time','2026-10-23T10:59:00','2026-10-23T11:01:00+00:00'):
+            with self.subTest(captured=captured):
+                value=report('healthy');value['results'].update(source_errors={},source_successes={'k':67},source_success_latest_at={'k':captured})
+                client=GitHubStore()
+                with self.assertRaises(ValueError):self.publish(client,value)
+                self.assertEqual(client.assets,{})
+        value=report('healthy');value['capture']={'run_summary':{'odds':1,'error':0,'end':'2026-10-23T11:01:00+00:00'}}
+        with self.assertRaises(ValueError):self.publish(GitHubStore(),value)
+
+
 class Response:
     def __init__(self, content=b'', status=200):
         self.content, self.status = content, status

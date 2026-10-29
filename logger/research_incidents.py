@@ -33,12 +33,20 @@ def incident_key(day,issue):
     if code in ('capture_run_all_error','known_schedule_lost_on_restart','schedule_unknown','unexpected_empty_schedule'):return 'source/netkeirin'
     return 'coverage/'+day+'/'+component
 
-def healthy_for(key,report):
+def healthy_for(key,report,*,since=None):
+    def covers_incident(captured):
+        if since is None or captured is None:return False
+        try:return stamp(since)<=stamp(captured)<=stamp(report['observed_at'])
+        except (ValueError,TypeError,KeyError):return False
     results=report.get('results',{})
-    if key=='source/k':return results.get('source_successes',{}).get('k',0)>0 and not results.get('source_errors',{}).get('k',0)
+    if key=='source/k':
+        times=results.get('source_success_latest_at') or {}
+        return (isinstance(times,dict) and results.get('source_successes',{}).get('k',0)>0
+                and not results.get('source_errors',{}).get('k',0) and covers_incident(times.get('k')))
     if key=='source/netkeirin':
         run=report.get('capture',{}).get('run_summary') or {}
-        return report.get('schedule',{}).get('known') is True and run.get('odds',0)>0 and run.get('error',0)==0
+        return (report.get('schedule',{}).get('known') is True and run.get('odds',0)>0
+                and run.get('error')==0 and covers_incident(run.get('end')))
     # A healthy later day is not evidence that an old gap has been repaired.
     return key.split('/')[1]==report['day'] and report.get('schedule',{}).get('known') is True and not any(v.get('component') in ('evidence','schedule') for v in report.get('issues',[]))
 
@@ -93,7 +101,7 @@ def sync_report(report,client,*,now=None,run_url=None):
                 # Advance the observation watermark quietly, without a comment.
                 client.update_issue(issue['number'],body_for('open',meta,report,run_url))
     for key,(issue,old) in existing.items():
-        if key in active or observed<stamp(old['observed_at']) or not healthy_for(key,report):continue
+        if key in active or observed<stamp(old['observed_at']) or not healthy_for(key,report,since=old['observed_at']):continue
         meta=dict(old,state='resolved',codes=[],reported_on=today,observed_at=observed.isoformat())
         if old.get('state')!='resolved':client.comment(issue['number'],body_for('resolved',meta,report,run_url))
         client.close_issue(issue['number']);actions.append({'action':'resolved','number':issue['number'],'key':key})
