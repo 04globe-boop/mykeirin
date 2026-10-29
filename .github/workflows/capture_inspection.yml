@@ -1,0 +1,22 @@
+name: capture-inspection-20261029
+on:
+  push:
+    branches: [codex/capture-inspection-20261029]
+    paths: ["tools/inspect_capture_coverage.py", ".github/workflows/capture_inspection.yml"]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Tokyo
+      GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Inspect only copies without writing remote data
+        run: python tools/inspect_capture_coverage.py
