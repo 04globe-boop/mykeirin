@@ -122,6 +122,15 @@ def _safe_report(report, *, run_id, attempt, run_url, now):
     for name in ('source_errors', 'source_successes', 'source_errors_time_unknown'):
         if name in results:
             clean_results[name] = _count_map(results[name], SOURCE_NAMES)
+    if 'source_success_latest_at' in results:
+        times = results['source_success_latest_at']
+        _require(isinstance(times, dict), 'invalid_source_success_times')
+        clean_times = {}
+        for source in SOURCE_NAMES:
+            if source in times:
+                _require(_stamp(times[source]) <= observed, 'future_source_success_time')
+                clean_times[source] = times[source]
+        clean_results['source_success_latest_at'] = clean_times
     clean_cohorts = {}
     cohorts = report.get('cohorts', {})
     _require(isinstance(cohorts, dict), 'invalid_cohorts')
@@ -147,7 +156,8 @@ def _safe_report(report, *, run_id, attempt, run_url, now):
         clean_run = _counts(run, ('races_known', 'odds', 'lines', 'entries', 'miss', 'error'))
         for field in ('start', 'end'):
             if field in run:
-                _stamp(run[field]);clean_run[field] = run[field]
+                _require(_stamp(run[field]) <= observed, 'future_capture_summary_time')
+                clean_run[field] = run[field]
         clean_capture['run_summary'] = clean_run
     events = report.get('events', {})
     clean_events = _counts(events, ('legacy_miss_races', 'contradicted_miss_races', 'prediction_event_missing_races'))
@@ -173,6 +183,21 @@ def _signature(report):
         else:
             key = 'coverage/' + report['day'] + '/' + component
         values.add((key, code))
+    # Provider recovery must reach private incident handling even while an
+    # unrelated coverage issue keeps the overall report degraded.
+    def add_verified(key, captured):
+        if captured is not None:
+            # Actual provider time, not the later audit time. A newer proof must
+            # reach the receiver even if an older proof could not clear its watermark.
+            at = _stamp(captured)
+            if at <= _stamp(report['observed_at']):
+                values.add((key, 'verified_positive_at_' + at.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S%f')))
+    results = report.get('results', {})
+    if results.get('source_successes', {}).get('k', 0) > 0 and results.get('source_errors', {}).get('k', 0) == 0:
+        add_verified('source/k', results.get('source_success_latest_at', {}).get('k'))
+    run = report.get('capture', {}).get('run_summary') or {}
+    if report.get('schedule', {}).get('known') is True and run.get('odds', 0) > 0 and run.get('error') == 0:
+        add_verified('source/netkeirin', run.get('end'))
     return [list(value) for value in sorted(values)]
 
 
@@ -228,8 +253,14 @@ def publish_health(report, client, *, repo, run_id, run_attempt, run_url, clock=
     notification_day = _stamp(safe['observed_at']).astimezone(JST).strftime('%Y%m%d')
     signature = _signature(safe)
     fingerprint = _fingerprint(safe['day'], notification_day, safe['status'], signature)
-    should_notify = ((safe['status'] == 'degraded' and (prior is None or prior['fingerprint'] != fingerprint))
-                     or (safe['status'] == 'healthy' and prior is not None and prior['status'] == 'degraded'))
+    def positive_proofs(items):
+        return {tuple(value) for value in items if value[0] in ('source/k', 'source/netkeirin')
+                and (value[1] == 'verified_positive' or value[1].startswith('verified_positive_at_'))}
+    proofs = positive_proofs(signature)
+    prior_proofs = positive_proofs(prior['signature']) if prior is not None else set()
+    changed = prior is None or prior['fingerprint'] != fingerprint
+    should_notify = bool(changed and (safe['status'] == 'degraded' or proofs
+                         or (prior is not None and (prior['status'] == 'degraded' or prior_proofs != proofs))))
     result = {'schema_version': 'operational-health-publication-v1', 'asset_name': name,
               'repository': DATA_REPO, 'day': safe['day'], 'release_tag': _release_tag(safe['day']),
               'dispatched': False, 'fingerprint': fingerprint}
