@@ -98,8 +98,27 @@ def main():
             live[cohort].update(market_candidate={k:v for k,v in values['candidates'].get('market',{}).items() if k in ('predicted','primary','labelled','primary_labelled','missing_races')},raw_matched_market_rows=matched,market_rows=len(rows),market_age_at_actual_issue=stats(issue_ages),market_age_at_nominal_cutoff=stats(cutoff_ages))
         extra_rows=[v for v in read_records(extra/'extra_202610.jsonl.gz',[]) if str(v.get('race_id','')).startswith(day)]
         source_errors=Counter((str(v.get('what')),str(v.get('status')),bucket(v.get('error'))) for v in extra_rows if v.get('type')=='error')
+        raw_latest=max(adapter.capture_available_at(v) for v in records if v.get('fetched_at'))
+        missing_ids=set(report['cohorts']['v1']['missing_race_ids'])
+        md=Counter();notice_lags=[]
+        for rid in missing_ids:
+            cutoff=closes[rid]-timedelta(minutes=5);trigger=cutoff-timedelta(seconds=20)
+            md['missing_races']+=1
+            md['cutoff_before_latest_published_raw' if cutoff<=raw_latest else 'cutoff_after_latest_published_raw']+=1
+            try:adapter.latest_capture(records,rid,'entries',trigger.isoformat(),7200);md['card_available_at_trigger']+=1
+            except ValueError:md['card_missing_at_trigger']+=1
+            try:adapter.latest_capture(records,rid,'odds',trigger.isoformat(),180);md['recent_market_available_at_trigger']+=1
+            except ValueError:md['recent_market_missing_at_trigger']+=1
+            notices=[v for v in events if v.get('race_id')==rid and v.get('type') in ('miss','unavailable') and v.get('at')]
+            if notices:
+                first=min(notices,key=lambda v:data_module.stamp(v['at']))
+                md['first_notice_'+bucket(first.get('reason'))]+=1
+                notice_lags.append((data_module.stamp(first['at'])-cutoff).total_seconds())
+        missing_diagnostics={'counts':dict(md),'first_failure_notice_seconds_after_cutoff':stats(notice_lags),'latest_published_raw_time':raw_latest.isoformat()}
+        extra_source_races={kind:len({v.get('race_id') for v in extra_rows if v.get('type')==kind}) for kind in ('k','op')}
+        extra_source_races['op_http403_races']=len({v.get('race_id') for v in extra_rows if v.get('type')=='error' and v.get('what')=='op' and v.get('status')==403})
         history=read_records(out/'research_history.jsonl.gz',[])
         overlay={'races':len(history),'latest_race_date':max((v.get('date','') for v in history),default=None),'latest_available_at':max((v.get('available_at','') for v in history),default=None)}
         if inventory(out)!=before or inventory(Path('audit-runtime'))!=frozen or inventory(extra)!=extra_before:raise RuntimeError('Original copy changed')
-        print(json.dumps({'schema':'capture-coverage-inspection-v1','day':day,'observed_at':now.isoformat(),'scheduled':len(schedule),'closed_races':sum(v<=now for v in closes.values()),'raw_record_types':dict(Counter(v.get('type') for v in records)),'by_offset':by_offset,'strict_nominal_frames':frames,'cohorts':live,'unavailable_attempt_reason_buckets':dict(unavailable),'raw_errors_by_what':dict(error_what),'raw_miss_attempts_by_reason':dict(misses),'extra_error_buckets':[{'source':k[0],'status':k[1],'category':k[2],'count':v} for k,v in source_errors.items()],'history_overlay':overlay,'issues':[v['code'] for v in report['issues']],'original_files_unchanged':True,'performance_reported':False},ensure_ascii=False))
+        print(json.dumps({'schema':'capture-coverage-inspection-v1','day':day,'observed_at':now.isoformat(),'scheduled':len(schedule),'closed_races':sum(v<=now for v in closes.values()),'raw_record_types':dict(Counter(v.get('type') for v in records)),'by_offset':by_offset,'strict_nominal_frames':frames,'cohorts':live,'unavailable_attempt_reason_buckets':dict(unavailable),'raw_errors_by_what':dict(error_what),'raw_miss_attempts_by_reason':dict(misses),'extra_error_buckets':[{'source':k[0],'status':k[1],'category':k[2],'count':v} for k,v in source_errors.items()],'history_overlay':overlay,'missing_prediction_diagnostics':missing_diagnostics,'extra_source_unique_races':extra_source_races,'issues':[v['code'] for v in report['issues']],'original_files_unchanged':True,'performance_reported':False},ensure_ascii=False))
 if __name__=='__main__':main()
