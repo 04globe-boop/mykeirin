@@ -20,8 +20,10 @@ def flat(row: dict) -> dict:
     out["result_rank"] = row.get("result_rank_mkt")
     out["p_mkt_result"] = row.get("p_mkt_result")
     out["p_adj_result"] = row.get("p_adj_result")
+    out["p_model_result"] = row.get("p_model_result")
+    out["model_status"] = (row.get("model") or {}).get("status")
     bets, oc = row.get("bets") or {}, row.get("outcome") or {}
-    for k in "ABCD":
+    for k in "ABCDEFG":
         b = bets.get(k) or []
         out[f"{k}_combo"] = " / ".join(x["combo"] for x in b) or None
         out[f"{k}_odds"] = b[0]["odds_t5"] if len(b) == 1 else None

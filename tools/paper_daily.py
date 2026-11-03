@@ -1,7 +1,9 @@
 """買ったつもり帳の毎朝の更新（データを読むだけ。収集・研究のワークフローやReleasesは変更しない）。
 
 1. 2026-10-19〜昨日（JST）のうち、日別ファイルがない日・結果待ち／発走前が残る日・封印が解けた封印中の日を選ぶ
-2. mykeirin2 の Releases から、その日のロガー（odds-YYYY-MM/odds_YYYYMMDD.jsonl.gz）と結果（extra/extra_YYYYMM.jsonl.gz）を読む
+   （記録の形式が古い日〔E〜Gがない〕、独自モデルの予測ファイルがまだ出ていなかった日も作り直す）
+2. mykeirin2 の Releases から、その日のロガー（odds-YYYY-MM/odds_YYYYMMDD.jsonl.gz）と結果（extra/extra_YYYYMM.jsonl.gz）、
+   Codex側の前向き予測（forward-YYYY-MM/forward_YYYYMMDD.sqlite.gz と forward_inputs_YYYYMMDD.jsonl.gz）を読む
 3. tools/paper_trade.py で日別ファイル（claude_track/paper/rows_YYYYMMDD.json）を作り直す
 4. tools/paper_flat.py でダッシュボード用の paper_rows.json を作る
 
@@ -10,7 +12,9 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -19,12 +23,14 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paper_flat  # noqa: E402
+import paper_model  # noqa: E402
 import paper_trade  # noqa: E402
 
 JST = ZoneInfo("Asia/Tokyo")
 REPO = "04globe-boop/mykeirin2"
 FIRST = date(2026, 10, 19)
 REDO = {"結果待ち", "発走前"}
+MODEL_FIRST = "20261020"  # 独自モデル（Codex v2）の前向き予測が始まった日
 
 
 def asset(tag: str, name: str, dest: str) -> bool:
@@ -46,6 +52,10 @@ def needs(path: str, d: date, now: datetime) -> bool:
     rows = json.load(open(path, encoding="utf-8"))
     st = {r.get("status") for r in rows}
     if st & REDO:
+        return True
+    if any(r.get("bets") and r.get("schema", 1) < paper_trade.SCHEMA for r in rows):
+        return True
+    if d.strftime("%Y%m%d") >= MODEL_FIRST and any((r.get("model") or {}).get("status") == "予測ファイルなし" for r in rows):
         return True
     return "封印中" in st and now >= paper_trade.UNSEAL_AT
 
@@ -76,7 +86,20 @@ def main(argv=None):
             asset("extra", f"extra_{ds[:6]}.jsonl.gz", extra)
             nk = os.path.join(a.work, f"nk_results_{ds[:6]}.jsonl.gz")
             asset("nk-results", f"nk_results_{ds[:6]}.jsonl.gz", nk)  # Kドリームスが取れないときの代わり（なければ使わない）
-            rows = paper_trade.build(ds, odds, extra, a.mult, None, now, nk if os.path.exists(nk) else None)
+            preds, mstat = None, "予測ファイルなし"
+            if ds >= MODEL_FIRST:
+                fsq = os.path.join(a.work, f"forward_{ds}.sqlite")
+                fin = os.path.join(a.work, f"forward_inputs_{ds}.jsonl.gz")
+                tag = f"forward-{ds[:4]}-{ds[4:6]}"
+                if asset(tag, f"forward_{ds}.sqlite.gz", fsq + ".gz") and asset(tag, f"forward_inputs_{ds}.jsonl.gz", fin):
+                    if not os.path.exists(fsq):
+                        with gzip.open(fsq + ".gz", "rb") as src, open(fsq, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    preds, mstat = paper_model.load_day(fsq, fin), "ok"
+            else:
+                mstat = "運用前"
+            rows = paper_trade.build(ds, odds, extra, a.mult, None, now, nk if os.path.exists(nk) else None,
+                                     model_preds=preds, model_status=mstat)
             json.dump(rows, open(out, "w", encoding="utf-8"), ensure_ascii=False)
             from collections import Counter
             report.append(f"{ds}: " + ", ".join(f"{k} {v}" for k, v in Counter(r["status"] for r in rows).items()))

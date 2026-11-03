@@ -9,6 +9,15 @@ Kドリームスの結果ページ（extra収集の type=k）の払戻で当た�
   C 補正の上位5点 … 補正後の確率の上位5点（500円）
   D ライン独占狙い … 市場の人気30位以内で、補正が最も確率を上げた目を1点（同率なら補正後の確率が高い方）
 
+追加の買い方（2026-11-03に固定。結果を見る前に決めた。A〜Dは変えない）：
+  独自モデル＝Codex側の前向き予測 v2 の GBDT+GNN 融合（オッズを入力に使わない。2026-10-20凍結。tools/paper_model.py）
+  E 独自モデルの本命   … 独自モデルで一番確率の高い3連単を1点（100円）
+  F 独自モデルの上位5点 … 独自モデルの確率の上位5点（500円）
+  G 独自モデルの割安狙い … 市場の人気30位以内で、独自モデルの確率×締切5分前オッズ（期待値）が最大の目を1点
+                         （同値なら独自モデルの確率が高い方）。期待値が1未満でも買う（D と同じく毎レース1点）
+  独自モデルの予測がない・車番に対応できないレースは、E〜Gを買わない（購入0円。A〜Dはそのまま）。
+  10/20より前は独自モデルの予測がないので、E〜Gは10/20から。
+
 封印：2026-11-21〜2027-01-19のレースは、2027-01-20 03:00 JSTまで買い目だけを記録し、結果は付けない
 （Codex側の未閲覧試験期間。市場補正の成績を先に見ないため）。
 
@@ -30,11 +39,14 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hist_features import scratched_cars  # noqa: E402
 from market_scan import band_of, implied, line_ids, structure  # noqa: E402
+import paper_model  # noqa: E402
 
 JST = ZoneInfo("Asia/Tokyo")
 SEAL_START, SEAL_END = "20261121", "20270119"
 UNSEAL_AT = datetime(2027, 1, 20, 3, 0, tzinfo=JST)
-STRATEGIES = {"A": "市場の本命", "B": "補正の本命", "C": "補正の上位5点", "D": "ライン独占狙い"}
+STRATEGIES = {"A": "市場の本命", "B": "補正の本命", "C": "補正の上位5点", "D": "ライン独占狙い",
+              "E": "独自モデルの本命", "F": "独自モデルの上位5点", "G": "独自モデルの割安狙い"}
+SCHEMA = 2  # 2: E〜G（独自モデル）を追加
 TRI_RE = re.compile(r"(\d+)-(\d+)-(\d+)\s*([\d,]+)円")
 
 
@@ -82,6 +94,17 @@ def picks(od: dict, lines_raw: dict, mult: dict):
     return {"A": [ranked[0][0]], "B": [byq[0]], "C": byq[:5], "D": [d]}, p, q, odds, rank, bool(feat)
 
 
+def model_picks(pm: dict, p: dict, odds: dict, rank: dict):
+    """独自モデル（車番つき確率 pm）から E〜G の買い目。"""
+    byq = sorted(pm, key=lambda c: -pm[c])
+    cand = [c for c in pm if rank.get(c, 10 ** 9) <= 30 and c in odds]
+    g = max(cand, key=lambda c: (pm[c] * odds[c], pm[c])) if cand else None
+    sel = {"E": [byq[0]], "F": byq[:5]}
+    if g:
+        sel["G"] = [g]
+    return sel
+
+
 def result_of(extra: list[dict], rid: str):
     ks = [r for r in extra if r.get("type") == "k" and str(r.get("race_id")) == rid and (r.get("data") or {}).get("result")]
     if not ks:
@@ -115,7 +138,8 @@ def nk_result_of(nk: list[dict], rid: str):
 
 
 def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_json: str | None, now: datetime,
-          nk_path: str | None = None):
+          nk_path: str | None = None, model_preds: dict | None = None, model_status: str = "ok"):
+    """model_preds: paper_model.load_day の戻り値（なければ None。model_status にその理由）。"""
     mult = load_mult(mult_path)
     nk = read_gz(nk_path) if nk_path else []
     recs = read_gz(odds_path)
@@ -132,7 +156,7 @@ def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_js
     for rid in sorted(races):
         meta = races[rid]
         row = {"race_id": rid, "date": f"{date[:4]}-{date[4:6]}-{date[6:]}", "venue": meta.get("jyo"), "race_no": int(rid[-2:]),
-               "start": meta.get("start"), "grade": meta.get("jyoken"), "n_cars": int(meta.get("tosu") or 0)}
+               "start": meta.get("start"), "grade": meta.get("jyoken"), "n_cars": int(meta.get("tosu") or 0), "schema": SCHEMA}
         od = latest(recs, rid, "odds", "-5")
         ln = latest(recs, rid, "lines", "-7") or latest(recs, rid, "lines", "-5") or latest(recs, rid, "lines", "-60")
         pk = picks(od["data"], ln["data"] if ln else {}, mult) if od and isinstance(od.get("data"), dict) else None
@@ -144,7 +168,14 @@ def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_js
         sel, p, q, odds, rank, has_lines = pk
         row["has_lines"] = has_lines
         row["odds_at"] = od.get("fetched_at")
-        row["bets"] = {k: [{"combo": "-".join(c), "odds_t5": odds.get(c), "rank": rank[c], "p_mkt": round(p[c], 5), "p_adj": round(q[c], 5)}
+        pm, why = (paper_model.to_cars(model_preds.get(rid), od["data"]) if model_preds is not None else (None, model_status))
+        row["model"] = {"name": paper_model.MODEL_NAME, "status": why}
+        if pm:
+            row["model"]["recorded_at"] = model_preds[rid]["recorded_at"]
+            sel = {**sel, **model_picks(pm, p, odds, rank)}
+        pm = pm or {}
+        row["bets"] = {k: [{"combo": "-".join(c), "odds_t5": odds.get(c), "rank": rank.get(c), "p_mkt": round(p.get(c, 0), 5),
+                            "p_adj": round(q.get(c, 0), 5), **({"p_model": round(pm[c], 5)} if c in pm else {})}
                            for c in v] for k, v in sel.items()}
         if sealed:
             row["status"] = "封印中"
@@ -176,6 +207,8 @@ def build(date: str, odds_path: str, extra_path: str, mult_path: str, results_js
             row["result_rank_mkt"] = rank.get(first)
             row["p_mkt_result"] = round(p.get(first, 0), 6)
             row["p_adj_result"] = round(q.get(first, 0), 6)
+            if pm:
+                row["p_model_result"] = round(pm.get(first, 0), 6)
             row["outcome"] = {}
             for k, v in sel.items():
                 ret = sum(wins.get(c, 0) for c in v)
@@ -191,14 +224,18 @@ def main(argv=None):
     ap.add_argument("--extra", default="")
     ap.add_argument("--mult", default=os.path.join(os.path.dirname(__file__), "..", "..", "mykeirin2", "claude_track", "proto", "proto_v0.js"))
     ap.add_argument("--results-json", default=None)
+    ap.add_argument("--forward-sqlite", default=None, help="forward_YYYYMMDD.sqlite（展開済み）")
+    ap.add_argument("--forward-inputs", default=None, help="forward_inputs_YYYYMMDD.jsonl.gz")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    rows = build(a.date, a.odds, a.extra, a.mult, a.results_json, datetime.now(JST))
+    preds = paper_model.load_day(a.forward_sqlite, a.forward_inputs) if a.forward_sqlite and a.forward_inputs else None
+    rows = build(a.date, a.odds, a.extra, a.mult, a.results_json, datetime.now(JST), model_preds=preds,
+                 model_status="ok" if preds is not None else "予測ファイルなし")
     json.dump(rows, open(a.out, "w", encoding="utf-8"), ensure_ascii=False)
     from collections import Counter
     print(a.date, len(rows), Counter(r["status"] for r in rows))
     for k, name in STRATEGIES.items():
-        done = [r for r in rows if r.get("status") == "確定"]
+        done = [r for r in rows if r.get("status") == "確定" and k in r["outcome"]]
         cost = sum(r["outcome"][k]["cost"] for r in done)
         ret = sum(r["outcome"][k]["return"] for r in done)
         hit = sum(r["outcome"][k]["hit"] for r in done)
