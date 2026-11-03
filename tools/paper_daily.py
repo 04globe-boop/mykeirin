@@ -92,10 +92,11 @@ def main(argv=None):
                 fin = os.path.join(a.work, f"forward_inputs_{ds}.jsonl.gz")
                 tag = f"forward-{ds[:4]}-{ds[4:6]}"
                 if asset(tag, f"forward_{ds}.sqlite.gz", fsq + ".gz") and asset(tag, f"forward_inputs_{ds}.jsonl.gz", fin):
-                    if not os.path.exists(fsq):
-                        with gzip.open(fsq + ".gz", "rb") as src, open(fsq, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
+                    with gzip.open(fsq + ".gz", "rb") as src, open(fsq, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
                     preds, mstat = paper_model.load_day(fsq, fin), "ok"
+                    for f in (fsq, fsq + ".gz", fin):  # 1日約50MBになるので、読み終えたら消す（作業用の写しだけ）
+                        os.remove(f)
             else:
                 mstat = "運用前"
             rows = paper_trade.build(ds, odds, extra, a.mult, None, now, nk if os.path.exists(nk) else None,
