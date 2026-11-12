@@ -388,6 +388,59 @@ class PrivateHealthHandoff(unittest.TestCase):
         value=report('healthy');value['capture']={'run_summary':{'odds':1,'error':0,'end':'2026-10-23T11:01:00+00:00'}}
         with self.assertRaises(ValueError):self.publish(GitHubStore(),value)
 
+    def test_op_and_legacy_k_outages_have_distinct_notification_keys(self):
+        client=GitHubStore();value=report();value['issues'][0]['source']='op'
+        self.publish(client,value)
+        self.assertEqual(client.last_receipt['signature'],[['source/op','result_source_all_error']])
+        value['issues'][0].pop('source')
+        self.assertTrue(self.publish(client,value,run_id='12346')['dispatched'])
+        self.assertEqual(client.last_receipt['signature'],[['source/k','result_source_all_error']])
+
+    def test_op_positive_proof_dispatches_once_per_actual_success_time(self):
+        client=GitHubStore();value=report('healthy')
+        value['results'].update(source_errors={},source_successes={'op':1},source_success_latest_at={'op':'2026-10-23T10:50:00+00:00'})
+        self.assertTrue(self.publish(client,value)['dispatched'])
+        self.assertEqual(client.last_receipt['signature'],[['source/op','verified_positive_at_20261023105000000000']])
+        value['results']['source_successes']['op']=50
+        self.assertFalse(self.publish(client,value,run_id='12346')['dispatched'])
+        value['results']['source_success_latest_at']['op']='2026-10-23T19:50:00+09:00'
+        self.assertFalse(self.publish(client,value,run_id='12347')['dispatched'])
+        value['results']['source_success_latest_at']['op']='2026-10-23T10:55:00+00:00'
+        self.assertTrue(self.publish(client,value,run_id='12348')['dispatched'])
+        self.assertEqual(len(client.dispatches),2)
+
+    def test_op_recovery_reaches_receiver_while_other_coverage_stays_degraded(self):
+        client=GitHubStore();value=report()
+        value['issues']=[{'code':'forecast_missing','component':'inference','severity':'error'}]
+        value['results'].update(source_errors={},source_successes={})
+        self.publish(client,value)
+        value['results'].update(source_successes={'op':1},source_success_latest_at={'op':'2026-10-23T10:59:00+00:00'})
+        self.assertTrue(self.publish(client,value,run_id='12346')['dispatched'])
+        self.assertEqual(len(client.dispatches),2)
+
+    def test_op_missing_invalid_or_future_success_time_never_emits_positive_proof(self):
+        value=report('healthy');value['results'].update(source_errors={},source_successes={'op':1})
+        self.assertFalse(self.publish(GitHubStore(),value)['dispatched'])
+        for captured in (None,'bad-time','2026-10-23T10:59:00','2026-10-23T11:01:00+00:00'):
+            with self.subTest(captured=captured):
+                value['results']['source_success_latest_at']={'op':captured};client=GitHubStore()
+                with self.assertRaises(ValueError):self.publish(client,value)
+                self.assertEqual(client.assets,{})
+
+    def test_conflict_counts_survive_privacy_filter_without_raw_id_or_scores(self):
+        value=report();value['issues']=[{'code':'result_sources_disagree','component':'results','races':1,
+                                      'race_id':'202610231201','truth':['PRIVATE RUNNER'],'nll':4.2}]
+        value['results'].update(source_conflict_races=1,observation_status_counts={'source_conflict':1},
+                                observation_reason_counts={'result_sources_disagree':1,'PRIVATE RUNNER':2,'202610231201':1},
+                                conflict_race_ids=['202610231201'],nll=4.2)
+        client=GitHubStore();result=self.publish(client,value);raw=client.assets[result['asset_name']].decode()
+        saved=json.loads(raw)['results']
+        self.assertEqual(saved.get('source_conflict_races'),1)
+        self.assertEqual(saved.get('observation_status_counts'),{'source_conflict':1})
+        self.assertEqual(saved.get('observation_reason_counts'),{'result_sources_disagree':1,'other':3})
+        for private in ('PRIVATE RUNNER','202610231201','truth','nll','conflict_race_ids'):
+            self.assertNotIn(private,raw)
+
 
 class Response:
     def __init__(self, content=b'', status=200):

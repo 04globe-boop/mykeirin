@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 JST=ZoneInfo('Asia/Tokyo')
 SCHEMA='operational-health-v1'
+OBSERVATION_STATUSES=('ready','pending','unavailable','invalid','excluded_tie','refund','source_conflict','admitted','already_labelled')
+SOURCE_CONFLICT_REASONS=('result_sources_disagree','existing_label_revision_requires_review','existing_history_revision_requires_review')
 
 def digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,ensure_ascii=False,allow_nan=False).encode()).hexdigest()
@@ -152,9 +154,23 @@ def audit_day(data_dir,day,bundles,*,now=None,extra_path=None,failures=()):
     observations=read_records(out/f'forward_observations_{day}.jsonl',issues)
     if not observations:observations=read_records(out/f'forward_observations_{day}.jsonl.gz',issues)
     latest_observations={}
-    for value in observations:
+    def observation_order(value):
+        try:return stamp(value.get('recorded_at'))
+        except (ValueError,TypeError,AttributeError):return datetime.min.replace(tzinfo=timezone.utc)
+    for value in sorted(observations,key=observation_order):
         try:
             rid=value['race_id'];recorded=stamp(value['recorded_at'])
+            if not isinstance(rid,str):raise ValueError('Invalid observation identity')
+            if value.get('status')=='source_conflict':
+                # A conflict is an immediate operational fault, but only actual,
+                # chronologically valid source evidence can establish it.
+                available=stamp(value['available_at'])
+                if (value.get('schema_version')!='result-observation-v1'
+                    or value.get('reason') not in SOURCE_CONFLICT_REASONS
+                    or value.get('source_type') not in ('k','nk_result')
+                    or not isinstance(value.get('source_id'),str) or not value['source_id']
+                    or not re.fullmatch(r'[a-f0-9]{64}',str(value.get('source_sha256','')))
+                    or not available<=recorded<=now):raise ValueError('Invalid conflict evidence')
             missing_source=(value.get('schema_version')=='result-observation-v1'
                             and value.get('status')=='unavailable' and value.get('reason')=='no_result_observation'
                             and all(key in value and value[key] is None for key in
@@ -163,9 +179,24 @@ def audit_day(data_dir,day,bundles,*,now=None,extra_path=None,failures=()):
             if not rid.startswith(day) or recorded>now:continue
             # A failed lookup does not refute a previously confirmed result.
             if missing_source:continue
+            previous=latest_observations.get(rid)
+            if previous and previous.get('status')=='source_conflict' and recorded>=stamp(previous['recorded_at']):
+                # A new lookup is not proof that a known disagreement was resolved.
+                if value.get('status') not in ('source_conflict','admitted','already_labelled','excluded_tie','refund'):continue
+                available=stamp(value['available_at'])
+                if (value.get('schema_version')!='result-observation-v1'
+                    or value.get('source_type') not in ('k','nk_result')
+                    or not isinstance(value.get('source_id'),str) or not value['source_id']
+                    or not re.fullmatch(r'[a-f0-9]{64}',str(value.get('source_sha256','')))
+                    or not available<=recorded<=now):raise ValueError('Invalid conflict resolution evidence')
             if rid not in latest_observations or recorded>=stamp(latest_observations[rid]['recorded_at']):latest_observations[rid]=value
         except (ValueError,TypeError,KeyError):issue('observation_evidence_invalid','results')
     observed_exclusions={rid:v.get('reason',v.get('status')) for rid,v in latest_observations.items() if v.get('status') in ('excluded_tie','refund')}
+    observation_status_counts=Counter(v.get('status') if v.get('status') in OBSERVATION_STATUSES else 'other' for v in latest_observations.values())
+    observation_reason_counts=Counter(reason if isinstance(reason,str) and re.fullmatch(r'[a-z_]{1,80}',reason) else 'other'
+                                      for v in latest_observations.values() if (reason:=v.get('reason')) is not None)
+    conflict_reasons=Counter(v['reason'] for v in latest_observations.values() if v.get('status')=='source_conflict')
+    for reason,count in sorted(conflict_reasons.items()):issue(reason,'results',races=count)
     source_records=read_records(extra_path,issues) if extra_path else []
     source_records=[v for v in source_records if str(v.get('race_id','')).startswith(day) or (v.get('what')=='racelist' and v.get('kaisai_date')==day)]
     latest_sources={};untimed_errors=Counter()
@@ -188,7 +219,8 @@ def audit_day(data_dir,day,bundles,*,now=None,extra_path=None,failures=()):
         source=str(value.get('type'));captured=value['fetched_at']
         if source not in success_latest_at or stamp(captured)>stamp(success_latest_at[source]):success_latest_at[source]=captured
     if extra_path and not Path(extra_path).exists():issue('result_source_file_missing','result_source')
-    if error_counts.get('k') and not successes.get('k'):issue('result_source_all_error','result_source',source='k',races=error_counts['k'])
+    for source in ('k','op'):
+        if error_counts.get(source) and not successes.get(source):issue('result_source_all_error','result_source',source=source,races=error_counts[source])
     if error_counts.get('racelist'):issue('result_source_schedule_failed','result_source',errors=error_counts['racelist'])
     unlabelled=actual-set(labels);unmatched=unlabelled-set(observed_exclusions)
     # K runs at 06:17 and NK at 06:47 JST (60-minute job budget), then a
@@ -222,7 +254,7 @@ def audit_day(data_dir,day,bundles,*,now=None,extra_path=None,failures=()):
         'schedule':{'known':known,'scheduled':len(schedule) if known else None,'scheduled_latest':latest_count,'completed_cutoffs':len(completed),'eligible':len(eligible),'excluded':len(excluded),'excluded_reasons':excluded,'eligibility_unverified':len(unverified),'pending_cutoffs':len(schedule)-len(completed)},
         'capture':{'record_types':dict(Counter(v.get('type','unknown') for v in records)),'run_summary':run},
         'cohorts':cohorts,
-        'results':{'prediction_races':len(actual),'labelled_races':len(actual&set(labels)),'unlabelled_races':len(unlabelled),'excluded_result_races':len(observed_exclusions),'excluded_reasons':observed_exclusions,'unmatched_races':len(unmatched),'unmatched_race_ids':sorted(unmatched),'source_errors':dict(error_counts),'source_successes':dict(successes),'source_success_latest_at':success_latest_at,'source_errors_time_unknown':dict(untimed_errors),'due':label_due,'expected_by':expected_by.isoformat()},
+        'results':{'prediction_races':len(actual),'labelled_races':len(actual&set(labels)),'unlabelled_races':len(unlabelled),'excluded_result_races':len(observed_exclusions),'excluded_reasons':observed_exclusions,'unmatched_races':len(unmatched),'unmatched_race_ids':sorted(unmatched),'source_conflict_races':sum(conflict_reasons.values()),'observation_status_counts':dict(observation_status_counts),'observation_reason_counts':dict(observation_reason_counts),'source_errors':dict(error_counts),'source_successes':dict(successes),'source_success_latest_at':success_latest_at,'source_errors_time_unknown':dict(untimed_errors),'due':label_due,'expected_by':expected_by.isoformat()},
         'events':{'record_types':dict(Counter(v.get('type','unknown') for v in events)),'legacy_miss_races':len(misses),'contradicted_miss_races':len(contradicted),'prediction_event_missing_races':len(event_missing)},
         'issues':issues,'performance_reported':False,'evaluation_denominator_changed':False}
 

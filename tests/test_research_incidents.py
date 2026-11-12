@@ -131,4 +131,47 @@ class IncidentLifecycle(unittest.TestCase):
                     research_incidents.sync_report(value,client,now=later)
                     self.assertEqual(client.closes,[])
 
+    def op_failure(self,at=NOW):
+        value=report(at=at,component='result_source',code='result_source_all_error')
+        value['issues'][0]['source']='op';value['results']['source_errors']={'op':86}
+        return value
+
+    def test_op_and_legacy_k_failures_create_distinct_provider_incidents(self):
+        client=FakeIssues();value=self.op_failure()
+        value['issues'].append({'component':'result_source','code':'result_source_all_error'})
+        actions=research_incidents.sync_report(value,client,now=NOW)
+        self.assertEqual([v['key'] for v in actions],['source/k','source/op'])
+        self.assertEqual(client.creates,2)
+
+    def test_k_success_cannot_resolve_op_outage(self):
+        client=FakeIssues();research_incidents.sync_report(self.op_failure(),client,now=NOW)
+        later=NOW+timedelta(minutes=10)
+        research_incidents.sync_report(report(bad=False,at=later),client,now=later)
+        self.assertEqual(client.closes,[])
+
+    def test_stale_missing_naive_malformed_or_future_op_time_cannot_close(self):
+        for captured in (None,'bad-time','2026-10-23T06:05:00','2026-10-23T05:59:00+00:00','2026-10-23T06:11:00+00:00'):
+            with self.subTest(captured=captured):
+                client=FakeIssues();research_incidents.sync_report(self.op_failure(),client,now=NOW)
+                later=NOW+timedelta(minutes=10);value=report(bad=False,at=later)
+                value['results']['source_successes']['op']=1
+                if captured is not None:value['results']['source_success_latest_at']['op']=captured
+                research_incidents.sync_report(value,client,now=later)
+                self.assertEqual(client.closes,[])
+
+    def test_op_fresh_proof_covers_latest_watermark_and_closes_once(self):
+        client=FakeIssues();research_incidents.sync_report(self.op_failure(),client,now=NOW)
+        current=NOW+timedelta(minutes=5)
+        research_incidents.sync_report(self.op_failure(at=current),client,now=current)
+        later=NOW+timedelta(minutes=10);value=report(bad=False,at=later)
+        value['results']['source_successes']={'op':1}
+        value['results']['source_success_latest_at']={'op':(NOW+timedelta(minutes=4)).isoformat()}
+        research_incidents.sync_report(value,client,now=later)
+        self.assertEqual(client.closes,[]);self.assertEqual(client.comments,{})
+        value['results']['source_success_latest_at']['op']=(NOW+timedelta(minutes=6)).isoformat()
+        research_incidents.sync_report(value,client,now=later)
+        research_incidents.sync_report(value,client,now=later)
+        self.assertEqual(client.closes,[1]);self.assertEqual(len(client.comments[1]),1)
+        self.assertIn('復旧',client.comments[1][0]['body'])
+
 if __name__=='__main__':unittest.main()

@@ -187,6 +187,97 @@ class CoverageContract(unittest.TestCase):
                     reason='no_result_observation',available_at=None,source_id=None,
                     source_type=None,source_sha256=None,recorded_at='2026-10-23T06:30:00+09:00')
 
+    def conflict_receipt(self,rid,**changes):
+        value=dict(schema_version='result-observation-v1',race_id=rid,status='source_conflict',
+                   reason='result_sources_disagree',available_at='2026-10-23T06:00:00+09:00',
+                   recorded_at='2026-10-23T06:30:00+09:00',source_type='nk_result',
+                   source_id='https://example.test/result',source_sha256='a'*64)
+        value.update(changes)
+        return value
+
+    def test_verified_source_conflict_is_reported_before_and_after_label_deadline(self):
+        for at in ('2026-10-23T07:00:00+09:00','2026-10-23T10:00:00+09:00'):
+            with self.subTest(at=at), tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+                data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+                receipt=self.conflict_receipt(rid)
+                path=data/f'forward_observations_{DAY}.jsonl'
+                path.write_text(json.dumps(receipt)+'\n',encoding='utf-8');before=path.read_bytes()
+                report=research_health.audit_day(data,DAY,bundles,now=datetime.fromisoformat(at))
+                conflicts=[v for v in report['issues'] if v['code']=='result_sources_disagree']
+                self.assertEqual(conflicts,[{'code':'result_sources_disagree','component':'results','severity':'error','races':1}])
+                self.assertEqual(report['results'].get('source_conflict_races'),1)
+                self.assertEqual(report['results'].get('observation_status_counts'),{'source_conflict':1})
+                self.assertEqual(report['results'].get('observation_reason_counts'),{'result_sources_disagree':1})
+                self.assertNotIn(rid,json.dumps(conflicts));self.assertEqual(path.read_bytes(),before)
+
+    def test_genuine_pending_source_remains_quiet_before_label_deadline(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+            receipt=self.conflict_receipt(rid,status='pending',reason='result_pending')
+            (data/f'forward_observations_{DAY}.jsonl').write_text(json.dumps(receipt)+'\n',encoding='utf-8')
+            report=research_health.audit_day(data,DAY,bundles,now=datetime.fromisoformat('2026-10-23T07:00:00+09:00'))
+            self.assertEqual([v for v in report['issues'] if v['component']=='results'],[])
+            self.assertEqual(report['results'].get('source_conflict_races'),0)
+            self.assertEqual(report['results'].get('observation_status_counts'),{'pending':1})
+            self.assertEqual(report['results'].get('observation_reason_counts'),{'result_pending':1})
+
+    def test_later_verified_exclusion_or_label_removes_active_source_conflict(self):
+        for status,reason in (('excluded_tie','top_three_tie'),('refund','whole_refund'),('admitted',None)):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+                data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64,label=status=='admitted')
+                conflict=self.conflict_receipt(rid)
+                verified=self.conflict_receipt(rid,status=status,reason=reason,available_at='2026-10-23T07:00:00+09:00',recorded_at='2026-10-23T07:30:00+09:00')
+                (data/f'forward_observations_{DAY}.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in (conflict,verified)),encoding='utf-8')
+                report=research_health.audit_day(data,DAY,bundles,now=NOW)
+                self.assertNotIn('result_sources_disagree',[v['code'] for v in report['issues']])
+                self.assertEqual(report['results'].get('source_conflict_races'),0)
+                self.assertEqual(report['results']['unmatched_races'],0)
+
+    def test_malformed_or_future_conflict_is_invalid_and_cannot_mask_verified_exclusion(self):
+        for changes in ({'available_at':None},{'available_at':'2026-10-23T06:00:00'},
+                        {'available_at':'2026-10-24T06:00:00+09:00'},
+                        {'recorded_at':'2026-10-24T06:30:00+09:00'},
+                        {'source_sha256':'not-a-digest'},{'reason':'private runner score 4.2'}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+                data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+                verified=self.conflict_receipt(rid,status='excluded_tie',reason='top_three_tie',recorded_at='2026-10-23T06:15:00+09:00')
+                conflict=self.conflict_receipt(rid,**changes)
+                (data/f'forward_observations_{DAY}.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in (verified,conflict)),encoding='utf-8')
+                report=research_health.audit_day(data,DAY,bundles,now=NOW)
+                codes=[v['code'] for v in report['issues']]
+                self.assertIn('observation_evidence_invalid',codes)
+                self.assertNotIn('result_sources_disagree',codes)
+                self.assertEqual(report['results']['excluded_result_races'],1)
+                self.assertEqual(report['results'].get('source_conflict_races'),0)
+
+    def test_observation_reason_counts_never_copy_untrusted_free_text_or_race_ids(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp))
+            receipt=self.conflict_receipt(rid,status='invalid',reason='private runner '+rid+' score=4.2')
+            (data/f'forward_observations_{DAY}.jsonl').write_text(json.dumps(receipt)+'\n',encoding='utf-8')
+            report=research_health.audit_day(data,DAY,bundles,now=NOW)
+            self.assertEqual(report['results'].get('observation_reason_counts'),{'other':1})
+
+    def test_op_all_error_remains_visible_when_k_has_succeeded(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));extra=data/'extra.jsonl.gz'
+            gz(extra,[{'type':'error','what':'op','race_id':rid,'fetched_at':'2026-10-23T06:00:00+09:00'},
+                      {'type':'k','race_id':rid,'fetched_at':'2026-10-23T06:20:00+09:00','data':{}}])
+            report=research_health.audit_day(data,DAY,bundles,now=NOW,extra_path=extra)
+            self.assertEqual([v for v in report['issues'] if v['code']=='result_source_all_error'],
+                             [{'code':'result_source_all_error','component':'result_source','severity':'error','source':'op','races':1}])
+            self.assertEqual(report['results']['source_success_latest_at'],{'k':'2026-10-23T06:20:00+09:00'})
+
+    def test_op_recovery_uses_latest_attempt_and_keeps_actual_source_time(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+            data,bundles,rid,_=self.fixture(Path(tmp));extra=data/'extra.jsonl.gz'
+            gz(extra,[{'type':'error','what':'op','race_id':rid,'fetched_at':'2026-10-23T06:00:00+09:00'},
+                      {'type':'op','race_id':rid,'fetched_at':'2026-10-23T06:20:00+09:00','data':{}}])
+            report=research_health.audit_day(data,DAY,bundles,now=NOW,extra_path=extra)
+            self.assertEqual(report['results']['source_successes'],{'op':1})
+            self.assertEqual(report['results']['source_success_latest_at'],{'op':'2026-10-23T06:20:00+09:00'})
+            self.assertNotIn('result_source_all_error',[v['code'] for v in report['issues']])
+
     def test_missing_source_receipt_is_not_corrupt_evidence_after_results_are_due(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
             data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
@@ -238,5 +329,17 @@ class CoverageContract(unittest.TestCase):
                 report=research_health.audit_day(data,DAY,bundles,now=NOW)
                 self.assertEqual(report['results']['excluded_result_races'],0)
                 self.assertEqual(report['results']['unmatched_races'],1)
+
+    def test_pending_invalid_or_unadmitted_lookup_cannot_resolve_a_known_conflict(self):
+        for status in ('pending','invalid','ready'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=os.environ.get('KEIRIN_TEST_TMP')) as tmp:
+                data,bundles,rid,_=self.fixture(Path(tmp));self.prediction(data,rid,'a'*64)
+                conflict=self.conflict_receipt(rid)
+                later=self.conflict_receipt(rid,status=status,reason='result_pending',available_at='2026-10-23T06:40:00+09:00',recorded_at='2026-10-23T06:45:00+09:00')
+                path=data/f'forward_observations_{DAY}.jsonl'
+                path.write_text(''.join(json.dumps(v)+'\n' for v in (later,conflict)),encoding='utf-8')
+                report=research_health.audit_day(data,DAY,bundles,now=datetime.fromisoformat('2026-10-23T07:00:00+09:00'))
+                self.assertIn('result_sources_disagree',[v['code'] for v in report['issues']])
+                self.assertEqual(report['results']['source_conflict_races'],1)
 
 if __name__=='__main__':unittest.main()
