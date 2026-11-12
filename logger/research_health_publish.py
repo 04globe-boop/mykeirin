@@ -21,6 +21,8 @@ SOURCE_REPO = '04globe-boop/mykeirin'
 DATA_REPO = '04globe-boop/mykeirin2'
 TAG = 'operational-health'
 SOURCE_NAMES = ('k', 'nk', 'nk_result', 'o', 'op', 'oddspark', 'racelist', 'netkeirin', 'unknown')
+OBSERVATION_STATUSES = ('ready', 'pending', 'unavailable', 'invalid', 'excluded_tie', 'refund',
+                        'source_conflict', 'admitted', 'already_labelled', 'other')
 CANDIDATE_NAMES = ('gbdt', 'gbdt+gnn', 'gbdt+hierarchical', 'gbdt+set_transformer', 'gnn',
                    'hierarchical', 'market', 'orthodox', 'score_pl', 'set_transformer')
 MAX_BYTES = 2_000_000
@@ -118,7 +120,17 @@ def _safe_report(report, *, run_id, attempt, run_url, now):
         clean_schedule['known'] = schedule['known']
     results = report.get('results', {})
     clean_results = _counts(results, ('prediction_races', 'labelled_races', 'unlabelled_races',
-                           'excluded_result_races', 'unmatched_races'))
+                           'excluded_result_races', 'unmatched_races', 'source_conflict_races'))
+    if 'observation_status_counts' in results:
+        clean_results['observation_status_counts'] = _count_map(results['observation_status_counts'], OBSERVATION_STATUSES)
+    if 'observation_reason_counts' in results:
+        reasons = results['observation_reason_counts']
+        _require(isinstance(reasons, dict), 'invalid_observation_reason_counts')
+        clean_reasons = {}
+        for reason, count in _counts(reasons, reasons).items():
+            key = reason if isinstance(reason, str) and re.fullmatch(r'[a-z_]{1,80}', reason) else 'other'
+            clean_reasons[key] = clean_reasons.get(key, 0) + count
+        clean_results['observation_reason_counts'] = clean_reasons
     for name in ('source_errors', 'source_successes', 'source_errors_time_unknown'):
         if name in results:
             clean_results[name] = _count_map(results[name], SOURCE_NAMES)
@@ -177,7 +189,7 @@ def _signature(report):
     for issue in report['issues']:
         code, component = issue['code'], issue['component']
         if code == 'result_source_all_error':
-            key = 'source/k'
+            key = 'source/op' if issue.get('source') == 'op' else 'source/k'
         elif code in ('capture_run_all_error', 'known_schedule_lost_on_restart', 'schedule_unknown', 'unexpected_empty_schedule'):
             key = 'source/netkeirin'
         else:
@@ -193,8 +205,9 @@ def _signature(report):
             if at <= _stamp(report['observed_at']):
                 values.add((key, 'verified_positive_at_' + at.astimezone(timezone.utc).strftime('%Y%m%d%H%M%S%f')))
     results = report.get('results', {})
-    if results.get('source_successes', {}).get('k', 0) > 0 and results.get('source_errors', {}).get('k', 0) == 0:
-        add_verified('source/k', results.get('source_success_latest_at', {}).get('k'))
+    for source in ('k', 'op'):
+        if results.get('source_successes', {}).get(source, 0) > 0 and results.get('source_errors', {}).get(source, 0) == 0:
+            add_verified('source/' + source, results.get('source_success_latest_at', {}).get(source))
     run = report.get('capture', {}).get('run_summary') or {}
     if report.get('schedule', {}).get('known') is True and run.get('odds', 0) > 0 and run.get('error') == 0:
         add_verified('source/netkeirin', run.get('end'))
@@ -254,7 +267,7 @@ def publish_health(report, client, *, repo, run_id, run_attempt, run_url, clock=
     signature = _signature(safe)
     fingerprint = _fingerprint(safe['day'], notification_day, safe['status'], signature)
     def positive_proofs(items):
-        return {tuple(value) for value in items if value[0] in ('source/k', 'source/netkeirin')
+        return {tuple(value) for value in items if value[0] in ('source/k', 'source/op', 'source/netkeirin')
                 and (value[1] == 'verified_positive' or value[1].startswith('verified_positive_at_'))}
     proofs = positive_proofs(signature)
     prior_proofs = positive_proofs(prior['signature']) if prior is not None else set()

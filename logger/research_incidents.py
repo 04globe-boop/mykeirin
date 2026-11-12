@@ -29,7 +29,7 @@ def incident_key(day,issue):
     code=issue.get('code','');component=issue.get('component','')
     if not re.fullmatch(r'[a-z_]{1,80}',str(code)) or not re.fullmatch(r'[a-z_]{1,40}',str(component)):
         raise ValueError('Invalid incident code/component')
-    if code=='result_source_all_error':return 'source/k'
+    if code=='result_source_all_error':return 'source/op' if issue.get('source')=='op' else 'source/k'
     if code in ('capture_run_all_error','known_schedule_lost_on_restart','schedule_unknown','unexpected_empty_schedule'):return 'source/netkeirin'
     return 'coverage/'+day+'/'+component
 
@@ -39,10 +39,11 @@ def healthy_for(key,report,*,since=None):
         try:return stamp(since)<=stamp(captured)<=stamp(report['observed_at'])
         except (ValueError,TypeError,KeyError):return False
     results=report.get('results',{})
-    if key=='source/k':
+    if key in ('source/k','source/op'):
+        source=key.split('/')[1]
         times=results.get('source_success_latest_at') or {}
-        return (isinstance(times,dict) and results.get('source_successes',{}).get('k',0)>0
-                and not results.get('source_errors',{}).get('k',0) and covers_incident(times.get('k')))
+        return (isinstance(times,dict) and results.get('source_successes',{}).get(source,0)>0
+                and not results.get('source_errors',{}).get(source,0) and covers_incident(times.get(source)))
     if key=='source/netkeirin':
         run=report.get('capture',{}).get('run_summary') or {}
         return (report.get('schedule',{}).get('known') is True and run.get('odds',0)>0

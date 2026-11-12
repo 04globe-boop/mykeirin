@@ -1,0 +1,53 @@
+name: postdeadline-health-audit
+on:
+  schedule:
+    - cron: "17 23 * * *" # 08:17 JST, after the unchanged 08:00 result deadline
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "Past target day YYYYMMDD; empty means yesterday"
+        required: false
+        default: ""
+permissions:
+  contents: read
+env:
+  TZ: Asia/Tokyo
+jobs:
+  prepare:
+    if: github.repository == '04globe-boop/mykeirin'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      day: ${{ steps.audit.outputs.day }}
+      asset: ${{ steps.audit.outputs.asset }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Audit immutable copies and stage private diagnostics only
+        id: audit
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          TARGET_DAY: ${{ github.event.inputs.day }}
+        run: python logger/research_health_audit.py prepare --day "$TARGET_DAY"
+  notify:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: research-state-writer
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate private evidence and deliver incident request
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          TARGET_DAY: ${{ needs.prepare.outputs.day }}
+          TARGET_ASSET: ${{ needs.prepare.outputs.asset }}
+        run: python logger/research_health_audit.py finish --day "$TARGET_DAY" --asset "$TARGET_ASSET"
