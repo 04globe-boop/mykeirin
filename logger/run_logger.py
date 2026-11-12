@@ -280,20 +280,29 @@ class Logger:
 
     def run(self) -> dict:
         t0 = self.clock()
-        end = t0 + self.window
+        nominal_end = t0 + self.window
+        end = nominal_end;handoff_guard_capped=False
         self.state = load_state(self.out_dir, self.days_to_watch(t0))
         self.refresh(t0)
         while True:
             now = self.clock()
             if self.last_refresh is None or (now - self.last_refresh).total_seconds() >= RACELIST_REFRESH_SEC:
                 self.refresh(now)
+            if self.forecaster is not None and getattr(self.forecaster,'workers',[True]):
+                from capture_window import prediction_handoff_end
+                end,capped=prediction_handoff_end(nominal_end,end,list(self.races.values()))
+                handoff_guard_capped=handoff_guard_capped or capped
+            else:
+                end=nominal_end
             due, upcoming = [], []
             if self.forecaster is not None:
                 try:
                     upcoming.extend(self.forecaster.tick(self.races.values(),now,end))
+                    if not getattr(self.forecaster,'workers',[True]):
+                        end=nominal_end
                 except Exception as error:
                     self.record_error(now.strftime('%Y%m%d'),None,'research_prediction',error,self.clock())
-                    self.forecaster.close();self.forecaster=None
+                    self.forecaster.close();self.forecaster=None;end=nominal_end
             for t, r, off in self.events(now, end):
                 if off < 0:
                     if now > r.close:  # 締切を過ぎた締切前の時点は取らない
@@ -328,7 +337,8 @@ class Logger:
             wait = (nxt - now).total_seconds()
             if wait > 0:
                 self.sleep(min(wait, 60))
-        summary = {"start": iso(t0), "end": iso(self.clock()), "races_known": len(self.races), **self.counts}
+        summary = {"start": iso(t0), "end": iso(self.clock()), "races_known": len(self.races), "nominal_end": iso(nominal_end),
+                   "planned_end": iso(end), "handoff_guard_capped": handoff_guard_capped, **self.counts}
         self.log(json.dumps(summary, ensure_ascii=False))
         return summary
 

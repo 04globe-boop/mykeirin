@@ -265,7 +265,9 @@ def main():
     if a.command=='pack':pack_state(a.data_dir,a.stage);return
     if not a.repo:p.error('--repo is required for network operations')
     if a.command=='upload':upload_state(a.repo,a.data_dir,a.history);return
-    days=[day] if a.command=='settle' or a.day else days_for_window(now,a.window_min)
+    from capture_window import MAX_HANDOFF_EXTENSION_SECONDS
+    restore_minutes=a.window_min+(MAX_HANDOFF_EXTENSION_SECONDS/60 if a.command=='prepare' else 0)
+    days=[day] if a.command=='settle' or a.day else days_for_window(now,restore_minutes)
     restored=[state_download(a.repo,a.data_dir,value) for value in days]
     try:bundles=install_bundles(a.repo,a.reference,'research-runtime')
     finally:
