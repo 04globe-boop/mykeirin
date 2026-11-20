@@ -81,7 +81,7 @@ def check(token, expiry, now):
 MESSAGES = {
     "SECRET_MISSING": ("error", "DATA_REPO_TOKEN was not supplied to this job."),
     "AUTH_REJECTED": ("error", "GitHub rejected the credential."),
-    "ACCESS_DENIED": ("error", "GitHub denied access. Check repository selection and permissions."),
+    "ACCESS_DENIED": ("error", "The repository or release is unavailable or access was denied. Check the target, tag and permissions."),
     "UNEXPECTED_REPOSITORY": ("error", "Destination repository identity or privacy check failed."),
     "UNEXPECTED_RELEASE": ("error", "The expected release was not returned."),
     "UNEXPECTED_HTTP_RESPONSE": ("error", "GitHub returned an unexpected response."),
