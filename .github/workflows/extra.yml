@@ -64,6 +64,10 @@ jobs:
     if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    concurrency:
+      group: extra-monthly-asset-writer
+      queue: max
+      cancel-in-progress: false
     outputs:
       day: ${{ steps.t.outputs.day }}
       ym: ${{ steps.t.outputs.ym }}
@@ -94,21 +98,27 @@ jobs:
             echo "day=${D//-/}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download existing file (resume)
-        run: |
-          mkdir -p extra
-          gh release download "$TAG" --repo "$DATA_REPO" -p "extra_${{ steps.t.outputs.ym }}.jsonl.gz" -D extra --clobber 2>/dev/null || echo "no existing file"
+      - name: Restore and verify original
+        id: restore
+        env:
+          ASSET_NAME: extra_${{ steps.t.outputs.ym }}.jsonl.gz
+        run: python logger/result_asset_guard.py restore "$ASSET_NAME" extra
 
       - name: Collect
         run: python logger/collect_extra.py ${{ steps.t.outputs.args }} --out-dir extra --max-minutes 320 --status-file status.json
 
       - name: Upload
-        if: always()
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
+        env:
+          ASSET_NAME: extra_${{ steps.t.outputs.ym }}.jsonl.gz
         run: |
-          gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$DATA_REPO" --title "extra" --notes "Kドリームス・オッズパークの走り評・記者評価・選手コメント・レース後談話（月ごとのファイル）"
-          for F in extra/extra_*.jsonl.gz; do
-            [ -e "$F" ] && gh release upload "$TAG" "$F" --repo "$DATA_REPO" --clobber
-          done
+          ACTION=$(python logger/result_asset_guard.py verify "$ASSET_NAME" extra)
+          case "$ACTION" in
+            unchanged) echo "No new result records" ;;
+            create) gh release upload "$TAG" "extra/$ASSET_NAME" --repo "$DATA_REPO" ;;
+            replace) gh release upload "$TAG" "extra/$ASSET_NAME" --repo "$DATA_REPO" --clobber ;;
+            *) exit 1 ;;
+          esac
 
       - name: Chain next run
         if: success() && github.event.inputs.month != ''
